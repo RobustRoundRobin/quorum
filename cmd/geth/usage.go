@@ -304,6 +304,13 @@ var AppHelpFlagGroups = []flagGroup{
 			utils.IstanbulBlockPeriodFlag,
 		},
 	},
+	{
+		Name: "RORORO",
+		Flags: []cli.Flag{
+			utils.RoRoRoCandidatesFlag,
+			utils.RoRoRoEndorsersFlag,
+		},
+	},
 	// END QUORUM
 	{
 		Name: "MISC",

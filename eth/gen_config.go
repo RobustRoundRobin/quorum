@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
+	"github.com/ethereum/go-ethereum/consensus/rororo"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -44,13 +45,17 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		TxPool                  core.TxPoolConfig
 		GPO                     gasprice.Config
 		EnablePreimageRecording bool
+		RaftMode                bool
+		EnableNodePermission    bool
 		Istanbul                istanbul.Config
+		RoRoRo                  rororo.Config
 		DocRoot                 string `toml:"-"`
 		EWASMInterpreter        string
 		EVMInterpreter          string
 		RPCGasCap               *big.Int                       `toml:",omitempty"`
 		Checkpoint              *params.TrustedCheckpoint      `toml:",omitempty"`
 		CheckpointOracle        *params.CheckpointOracleConfig `toml:",omitempty"`
+		OverrideIstanbul        *big.Int
 	}
 	var enc Config
 	enc.Genesis = c.Genesis
@@ -78,13 +83,17 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TxPool = c.TxPool
 	enc.GPO = c.GPO
 	enc.EnablePreimageRecording = c.EnablePreimageRecording
+	enc.RaftMode = c.RaftMode
+	enc.EnableNodePermission = c.EnableNodePermission
 	enc.Istanbul = c.Istanbul
+	enc.RoRoRo = c.RoRoRo
 	enc.DocRoot = c.DocRoot
 	enc.EWASMInterpreter = c.EWASMInterpreter
 	enc.EVMInterpreter = c.EVMInterpreter
 	enc.RPCGasCap = c.RPCGasCap
 	enc.Checkpoint = c.Checkpoint
 	enc.CheckpointOracle = c.CheckpointOracle
+	enc.OverrideIstanbul = c.OverrideIstanbul
 	return &enc, nil
 }
 
@@ -116,13 +125,17 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		TxPool                  *core.TxPoolConfig
 		GPO                     *gasprice.Config
 		EnablePreimageRecording *bool
+		RaftMode                *bool
+		EnableNodePermission    *bool
 		Istanbul                *istanbul.Config
+		RoRoRo                  *rororo.Config
 		DocRoot                 *string `toml:"-"`
 		EWASMInterpreter        *string
 		EVMInterpreter          *string
 		RPCGasCap               *big.Int                       `toml:",omitempty"`
 		Checkpoint              *params.TrustedCheckpoint      `toml:",omitempty"`
 		CheckpointOracle        *params.CheckpointOracleConfig `toml:",omitempty"`
+		OverrideIstanbul        *big.Int
 	}
 	var dec Config
 	if err := unmarshal(&dec); err != nil {
@@ -203,8 +216,17 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.EnablePreimageRecording != nil {
 		c.EnablePreimageRecording = *dec.EnablePreimageRecording
 	}
+	if dec.RaftMode != nil {
+		c.RaftMode = *dec.RaftMode
+	}
+	if dec.EnableNodePermission != nil {
+		c.EnableNodePermission = *dec.EnableNodePermission
+	}
 	if dec.Istanbul != nil {
 		c.Istanbul = *dec.Istanbul
+	}
+	if dec.RoRoRo != nil {
+		c.RoRoRo = *dec.RoRoRo
 	}
 	if dec.DocRoot != nil {
 		c.DocRoot = *dec.DocRoot
@@ -223,6 +245,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.CheckpointOracle != nil {
 		c.CheckpointOracle = dec.CheckpointOracle
+	}
+	if dec.OverrideIstanbul != nil {
+		c.OverrideIstanbul = dec.OverrideIstanbul
 	}
 	return nil
 }

@@ -1309,7 +1309,8 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 // QUORUM
 // checks if the consensus engine is Rfat
 func (bc *BlockChain) isRaft() bool {
-	return bc.chainConfig.IsQuorum && bc.chainConfig.Istanbul == nil && bc.chainConfig.Clique == nil
+	return (bc.chainConfig.IsQuorum && bc.chainConfig.Istanbul == nil &&
+		bc.chainConfig.Clique == nil && bc.chainConfig.RoRoRo == nil)
 }
 
 // function specifically added for Raft consensus. This is called from mintNewBlock

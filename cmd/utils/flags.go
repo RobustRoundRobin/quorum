@@ -867,6 +867,17 @@ var (
 		Usage: "Default minimum difference between two consecutive block's timestamps in seconds",
 		Value: eth.DefaultConfig.Istanbul.BlockPeriod,
 	}
+	// RoRoRo settings
+	RoRoRoCandidatesFlag = cli.Uint64Flag{
+		Name:  "rororo.candidates",
+		Usage: "Number of leader candidates for each round",
+		Value: eth.DefaultConfig.RoRoRo.Candidates,
+	}
+	RoRoRoEndorsersFlag = cli.Uint64Flag{
+		Name:  "rororo.endorsers",
+		Usage: "Number of endorsers to use for each leadership round",
+		Value: eth.DefaultConfig.RoRoRo.Endorsers,
+	}
 )
 
 // MakeDataDir retrieves the currently requested data directory, terminating
@@ -1543,6 +1554,15 @@ func setRaft(ctx *cli.Context, cfg *eth.Config) {
 	cfg.RaftMode = ctx.GlobalBool(RaftModeFlag.Name)
 }
 
+func setRoRoRo(ctx *cli.Context, cfg *eth.Config) {
+	if ctx.GlobalIsSet(RoRoRoCandidatesFlag.Name) {
+		cfg.RoRoRo.Candidates = ctx.GlobalUint64(RoRoRoCandidatesFlag.Name)
+	}
+	if ctx.GlobalIsSet(RoRoRoEndorsersFlag.Name) {
+		cfg.RoRoRo.Endorsers = ctx.GlobalUint64(RoRoRoEndorsersFlag.Name)
+	}
+}
+
 // CheckExclusive verifies that only a single instance of the provided flags was
 // set by the user. Each flag might optionally be followed by a string type to
 // specialize it further.
@@ -1619,6 +1639,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 	// Quorum
 	setIstanbul(ctx, cfg)
 	setRaft(ctx, cfg)
+	setRoRoRo(ctx, cfg)
 
 	if ctx.GlobalIsSet(SyncModeFlag.Name) {
 		cfg.SyncMode = *GlobalTextMarshaler(ctx, SyncModeFlag.Name).(*downloader.SyncMode)

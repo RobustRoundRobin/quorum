@@ -243,7 +243,10 @@ func quorumValidateConsensus(stack *node.Node, isRaft bool) {
 		utils.Fatalf("Error retrieving Ethereum service: %v", err)
 	}
 
-	if !isRaft && ethereum.BlockChain().Config().Istanbul == nil && ethereum.BlockChain().Config().Clique == nil {
+	if !isRaft &&
+		ethereum.BlockChain().Config().Istanbul == nil &&
+		ethereum.BlockChain().Config().Clique == nil &&
+		ethereum.BlockChain().Config().RoRoRo == nil {
 		utils.Fatalf("Consensus not specified. Exiting!!")
 	}
 }

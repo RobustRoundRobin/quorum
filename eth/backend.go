@@ -299,6 +299,10 @@ func CreateConsensusEngine(ctx *node.ServiceContext, chainConfig *params.ChainCo
 		return istanbulBackend.New(&config.Istanbul, ctx.NodeKey(), db)
 	}
 
+	if chainConfig.RoRoRo != nil {
+		log.Crit("RoRoRo consensus TODO")
+	}
+
 	// Otherwise assume proof-of-work
 	switch config.Ethash.PowMode {
 	case ethash.ModeFake:

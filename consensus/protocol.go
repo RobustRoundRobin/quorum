@@ -15,6 +15,7 @@ const (
 	eth64      = 64
 	Istanbul64 = 64
 	Istanbul99 = 99
+	RoRoRo112  = 112
 )
 
 var (
@@ -41,6 +42,12 @@ var (
 		Name:     "Norewards",
 		Versions: []uint{0},
 		Lengths:  map[uint]uint64{0: 0},
+	}
+
+	RoRoRoProtocol = Protocol{
+		Name:     "RoRoRo",
+		Versions: []uint{RoRoRo112},
+		Lengths:  map[uint]uint64{RoRoRo112: 1},
 	}
 )
 

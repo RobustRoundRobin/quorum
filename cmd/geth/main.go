@@ -164,6 +164,8 @@ var (
 		utils.EmitCheckpointsFlag,
 		utils.IstanbulRequestTimeoutFlag,
 		utils.IstanbulBlockPeriodFlag,
+		utils.RoRoRoCandidatesFlag,
+		utils.RoRoRoEndorsersFlag,
 		utils.PluginSettingsFlag,
 		utils.PluginSkipVerifyFlag,
 		utils.PluginLocalVerifyFlag,
