@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/deckarep/golang-set"
+	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
@@ -275,16 +275,24 @@ func (w *worker) pendingBlock() *types.Block {
 // start sets the running status as 1 and triggers new work submitting.
 func (w *worker) start() {
 	atomic.StoreInt32(&w.running, 1)
-	if istanbul, ok := w.engine.(consensus.Istanbul); ok {
-		istanbul.Start(w.chain, w.chain.CurrentBlock, w.chain.HasBadBlock)
+
+	switch e := w.engine.(type) {
+	case consensus.Istanbul:
+		e.Start(w.chain, w.chain.CurrentBlock, w.chain.HasBadBlock)
+	case consensus.RoRoRo:
+		e.Start(w.chain, w.chain.CurrentBlock, w.chain.HasBadBlock)
 	}
+
 	w.startCh <- struct{}{}
 }
 
 // stop sets the running status as 0.
 func (w *worker) stop() {
-	if istanbul, ok := w.engine.(consensus.Istanbul); ok {
-		istanbul.Stop()
+	switch e := w.engine.(type) {
+	case consensus.Istanbul:
+		e.Stop()
+	case consensus.RoRoRo:
+		e.Stop()
 	}
 	atomic.StoreInt32(&w.running, 0)
 }

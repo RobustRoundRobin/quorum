@@ -156,4 +156,6 @@ type Istanbul interface {
 // and good efficiency.
 type RoRoRo interface {
 	Engine
+	Start(chain ChainReader, currentBlock func() *types.Block, hasBadBlock func(hash common.Hash) bool) error
+	Stop() error
 }

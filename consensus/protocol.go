@@ -47,7 +47,7 @@ var (
 	RoRoRoProtocol = Protocol{
 		Name:     "RoRoRo",
 		Versions: []uint{RoRoRo112},
-		Lengths:  map[uint]uint64{RoRoRo112: 1},
+		Lengths:  map[uint]uint64{RoRoRo112: 17},
 	}
 )
 

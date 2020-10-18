@@ -301,7 +301,7 @@ func CreateConsensusEngine(ctx *node.ServiceContext, chainConfig *params.ChainCo
 	}
 
 	if chainConfig.RoRoRo != nil {
-		rororo.New(&config.RoRoRo, ctx.NodeKey(), db)
+		return rororo.New(&config.RoRoRo, ctx.NodeKey(), db)
 	}
 
 	// Otherwise assume proof-of-work
