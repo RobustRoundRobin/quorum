@@ -48,7 +48,7 @@ var genesisExtraCommand = cli.Command{
 	Usage:  "Extra data for genesis document",
 	Action: genextra,
 	Flags: []cli.Flag{
-		cli.StringFlag{Name: "datadir"},
+		cli.StringFlag{Name: "datadir", Usage: "by default look for static-nodes.json in this directory"},
 		cli.StringFlag{Name: "key", Value: "key", Usage: "private key for the chain creator node (Ck)"},
 	},
 }
@@ -65,9 +65,10 @@ func readNodesJSON(path string) ([]*enode.Node, error) {
 		if url == "" {
 			continue
 		}
+
 		node, err := enode.Parse(enode.ValidSchemes, url)
 		if err != nil {
-			return nil, fmt.Errorf("Node URL %s: %v\n", url, err)
+			return nil, fmt.Errorf("node URL %s: %v", url, err)
 		}
 		nodes = append(nodes, node)
 	}
@@ -97,20 +98,23 @@ func genextra(ctx *cli.Context) error {
 		return err
 	}
 
+	signerNodeID := rororo.Pub2NodeID(&key.PublicKey)
+
 	enodes, err := readNodesJSON(staticNodesJson)
 	if err != nil {
 		return err
 	}
 
 	var initIdents []rororo.Enrolment
-
 	for _, en := range enodes {
-		if initIdents, err = rororo.IdentInit(key, initIdents, en.ID()); err != nil {
+		if initIdents, err = rororo.IdentInit(key, initIdents, rororo.Hash(en.ID())); err != nil {
 			return err
 		}
 	}
 
 	extra := &rororo.GenesisExtraData{}
+
+	// XXX: TODO cli option to provide explicit seed
 	seed := make([]byte, 32)
 	var nrand int
 	nrand, err = rand.Read(seed)
@@ -126,7 +130,23 @@ func genextra(ctx *cli.Context) error {
 	if b, err = rlp.EncodeToBytes(extra); err != nil {
 		return err
 	}
-	fmt.Println(hex.EncodeToString(b))
+	extraData := hex.EncodeToString(b)
+
+	// Before printing out the data, make sure it round trips ok.
+	extraDecoded := &rororo.GenesisExtraData{}
+	err = rlp.DecodeBytes(b, extraDecoded)
+	if err != nil {
+		return err
+	}
+	decodedSignerNodeID, err := rororo.SignerNodeID(extraDecoded.IdentInit[0].U, extraDecoded.IdentInit[0].Q[:])
+	if err != nil {
+		return err
+	}
+	if decodedSignerNodeID != signerNodeID {
+		return fmt.Errorf("genesis extra data serialisation is broken")
+	}
+	fmt.Println(extraData)
+
 	return nil
 }
 

@@ -17,6 +17,8 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+type Hash [32]byte
+
 func RlpEncodeToBytes(v interface{}) ([]byte, error) {
 	return rlp.EncodeToBytes(v)
 }
@@ -35,6 +37,10 @@ func Sign(h []byte, k *ecdsa.PrivateKey) ([]byte, error) {
 
 func Ecrecover(hash, sig []byte) ([]byte, error) {
 	return crypto.Ecrecover(hash, sig)
+}
+
+func VerifySignature(pub, digest, sig []byte) bool {
+	return crypto.VerifySignature(pub, digest, sig)
 }
 
 func RecoverPublic(h []byte, sig []byte) (*ecdsa.PublicKey, error) {

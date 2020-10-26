@@ -20,7 +20,7 @@ func TestRoundTripChainID(t *testing.T) {
 	extra1 := &GenesisExtraData{
 		ChainInit: ChainInit{
 			IdentInit: []Enrolment{
-				{Q: Quote{8, 9}, U: [32]byte{10, 11}},
+				{Q: Quote{8, 9}, U: Hash{10, 11}},
 			},
 			Seed:  []byte{0, 1, 2, 3},
 			Proof: []byte{4, 5, 6, 7},
@@ -37,9 +37,11 @@ func TestRoundTripChainID(t *testing.T) {
 
 	b, err = rlp.EncodeToBytes(extra2)
 	require.Nil(err)
-	// decode back into the original and check both chain ids are the same
-	err = rlp.DecodeBytes(b, extra1)
+	extra3 := &GenesisExtraData{}
+	err = rlp.DecodeBytes(b, extra3)
 	require.Nil(err)
 
-	require.Equal(extra1.ChainID, extra2.ChainID, "extra data encoding  of chainid is incorrect")
+	require.Equal(extra3.ChainID, extra2.ChainID, "extra data encoding  of chainid is incorrect")
+	require.Equal(extra1.IdentInit[0], extra2.IdentInit[0])
+	require.Equal(extra1.IdentInit[0], extra3.IdentInit[0])
 }

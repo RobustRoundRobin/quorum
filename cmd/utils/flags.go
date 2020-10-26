@@ -868,6 +868,16 @@ var (
 		Value: eth.DefaultConfig.Istanbul.BlockPeriod,
 	}
 	// RoRoRo settings
+	RoRoRoConfirmTimeoutFlag = cli.Uint64Flag{
+		Name:  "rororo.confirmtimeout",
+		Usage: "leader candidates wait this long (milliseconds) for the required confirmations before giving up",
+		Value: eth.DefaultConfig.RoRoRo.ConfirmTimeout,
+	}
+	RoRoRoRoundLengthFlag = cli.Uint64Flag{
+		Name:  "rororo.roundlength",
+		Usage: "each consensus round is losely syncrhonised to this duration (milliseconds)",
+		Value: eth.DefaultConfig.RoRoRo.RoundLength,
+	}
 	RoRoRoCandidatesFlag = cli.Uint64Flag{
 		Name:  "rororo.candidates",
 		Usage: "Number of leader candidates for each round",

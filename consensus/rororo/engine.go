@@ -4,7 +4,10 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/big"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -13,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
 )
@@ -20,6 +24,7 @@ import (
 var (
 	// Uncles not relevant outside of PoW
 	errInvalidUncleHash = errors.New("non empty uncle hash")
+	errNoGenesisHeader  = errors.New("failed to get genesis header")
 )
 
 const (
@@ -37,14 +42,22 @@ type API struct {
 	rororo *engine
 }
 
+// eng* types can be sent at any tome the the engines main channel.
+// engStop
+type engStop struct{}
+
 // engine implements consensus.Engine using Robust Round Robin consensus
 // https://arxiv.org/abs/1804.07391
 type engine struct {
+
+	// Don't change these while the engine is running
 	config     *Config
 	privateKey *ecdsa.PrivateKey
 	address    common.Address
 	logger     log.Logger
 	db         ethdb.Database
+	genesisEx  GenesisExtraData
+	nodeID     Hash // derived from privateKey
 
 	broadcaster consensus.Broadcaster
 
@@ -57,6 +70,9 @@ type engine struct {
 	// Track which messages we have posted on our local processing queue. We do
 	// not re-broadcast these. We do not re post these locally.
 	selfMessages *lru.ARCCache
+
+	runningWG sync.WaitGroup
+	runningCh chan interface{} // must be one of the Eng* types
 }
 
 // New create rororo consensus engine
@@ -66,15 +82,18 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 	// Only get err from NewRC if zize requested is <=0
 	peerMessages, _ := lru.NewARC(lruPeers)
 	selfMessages, _ := lru.NewARC(lruMessages)
-	return &engine{
+	e := &engine{
 		config:       config,
 		privateKey:   privateKey,
+		nodeID:       Pub2NodeID(&privateKey.PublicKey),
 		address:      crypto.PubkeyToAddress(privateKey.PublicKey),
 		logger:       logger,
 		db:           db,
 		peerMessages: peerMessages,
 		selfMessages: selfMessages,
 	}
+
+	return e
 }
 
 // Gossip the message to the provided peers, skipping self.
@@ -115,16 +134,85 @@ func (e *engine) SetBroadcaster(broadcaster consensus.Broadcaster) {
 	e.broadcaster = broadcaster
 }
 
+func (e *engine) stop() {
+	if e.runningCh != nil {
+		close(e.runningCh)
+		e.runningCh = nil
+		e.runningWG.Wait()
+	}
+}
+
+func (e *engine) startRound() error {
+	return nil
+}
+
+func (e *engine) run(
+	chain consensus.ChainReader,
+	currentBlock func() *types.Block,
+	hasBadBlock func(hash common.Hash) bool, ch <-chan interface{}) error {
+
+	defer e.runningWG.Done()
+	e.runningWG.Add(1)
+
+	roundTick := time.NewTicker(time.Duration(e.config.RoundLength) * time.Millisecond)
+	// Endorsed leader candidates will broadcast the new block at the end of
+	// the round according to their tickers. We reset the ticker each time we
+	// see a new block confirmed. This will cause all participants to losely
+	// align on the same time window for each round. In the absence of
+	// comminication, each node will simply initiate a new round.
+
+	for {
+		select {
+		case i := <-ch:
+			e.logger.Info("rororo engine.run recieved: %v", i)
+		case <-roundTick.C:
+			e.logger.Debug("rororo engine.run round expired")
+			// h := chain.CurrentHeader()
+		}
+	}
+}
+
 func (e *engine) Start(
 	chain consensus.ChainReader, currentBlock func() *types.Block, hasBadBlock func(hash common.Hash) bool) error {
 	e.logger.Info("RoRoRo Start")
+	e.stop()
 
-	h := chain.CurrentHeader()
-	e.logger.Info("genesis block", "extra", hex.EncodeToString(h.Extra))
+	// When Start is called we can be sure that everything we need is ready. So
+	// we process the genesis extra data here.
+	hg := chain.GetHeaderByNumber(0)
+	if hg == nil {
+		return errNoGenesisHeader
+	}
+	e.logger.Info("genesis block", "extra", hex.EncodeToString(hg.Extra))
+	err := rlp.DecodeBytes(hg.Extra, &e.genesisEx)
+	if err != nil {
+		return err
+	}
+
+	signerNodeID, err := SignerNodeID(e.genesisEx.IdentInit[0].U, e.genesisEx.IdentInit[0].Q[:])
+	if err != nil {
+		return err
+	}
+	var foundGenesisSigner bool
+	for _, en := range e.genesisEx.IdentInit {
+		if en.U == signerNodeID {
+			foundGenesisSigner = true
+			e.logger.Info("genesis", "signer nodeid", hex.EncodeToString(en.U[:]))
+			break
+		}
+	}
+	if !foundGenesisSigner {
+		return fmt.Errorf("genesis identity signer not enroled")
+	}
+
+	e.runningCh = make(chan interface{})
+	go e.run(chain, currentBlock, hasBadBlock, e.runningCh)
 
 	return nil
 }
+
 func (e *engine) Stop() error {
+	e.stop()
 	return nil
 }
 
@@ -141,6 +229,17 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 // via the VerifySeal method.
 func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header, seal bool) error {
 	e.logger.Info("RoRoRo VerifyHeader")
+	return e.verifyCascadingFields(chain, header)
+}
+
+// verifyCascadingFields verifies all the header fields that are not standalone,
+// rather depend on a batch of previous headers.
+func (e *engine) verifyCascadingFields(chain consensus.ChainReader, header *types.Header) error {
+	number := header.Number.Uint64()
+	// The genesis block is the always valid dead-end
+	if number == 0 {
+		return nil
+	}
 	return ErrNotImplemented
 }
 

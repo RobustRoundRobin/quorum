@@ -19,14 +19,14 @@ type Quote [65]byte
 
 type Enrolment struct {
 	Q Quote
-	U [32]byte // nodeid for genesis, EnrolmentBinding.U() otherwise
+	U Hash // nodeid for genesis, EnrolmentBinding.U() otherwise
 }
 
 // IdentInit creates, or extends, the identity initialisation vector for the extraData in
 // the genesis block. init is nil or the currently included identities. One or
 // more nodeids are passes as the trailing parameters. The updated init vector
 // is returned. See EIP-rororo/extraData of Block0
-func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...[32]byte) ([]Enrolment, error) {
+func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrolment, error) {
 
 	start := len(init)
 	init = append(init, make([]Enrolment, len(nodeids))...)
@@ -43,9 +43,9 @@ func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...[32]byte) ([]E
 
 type ChainInit struct {
 	IdentInit []Enrolment
-	He        [32]byte // Always zero, as there is no enclave code to hash
-	Seed      []byte   // generate using crypto/rand for now
-	Proof     []byte   // simply Sig(CK, Seed) for now, its not really meaningful until we add VRF support
+	He        Hash   // Always zero, as there is no enclave code to hash
+	Seed      []byte // generate using crypto/rand for now
+	Proof     []byte // simply Sig(CK, Seed) for now, its not really meaningful until we add VRF support
 }
 
 // Populate fills in a ChainInit ready for encoding in the genesis extraData
@@ -63,9 +63,9 @@ func (ci *ChainInit) Populate(ck *ecdsa.PrivateKey, initIdents []Enrolment, seed
 	return err
 }
 
-func (ci *ChainInit) ChainID() ([32]byte, error) {
+func (ci *ChainInit) ChainID() (Hash, error) {
 
-	id := [32]byte{}
+	id := Hash{}
 	b, err := RlpEncodeToBytes(ci)
 	if err != nil {
 		return id, err
@@ -76,7 +76,7 @@ func (ci *ChainInit) ChainID() ([32]byte, error) {
 
 type GenesisExtraData struct {
 	ChainInit
-	ChainID [32]byte // EncodeRLP fills this in automatically
+	ChainID Hash // EncodeRLP fills this in automatically
 }
 
 func (gd *GenesisExtraData) EncodeRLP(w io.Writer) error {
@@ -105,7 +105,7 @@ func (gd *GenesisExtraData) EncodeRLP(w io.Writer) error {
 // enrolment it is just the enode identity directly (they are already 32 byte
 // hashes). For operational enrolment it the hash of the rlp encoded
 // EnrolmentBinding struct
-func (q *Quote) Fill(a *ecdsa.PrivateKey, u [32]byte) error {
+func (q *Quote) Fill(a *ecdsa.PrivateKey, u Hash) error {
 
 	var err error
 	var b []byte
@@ -123,7 +123,7 @@ func (q *Quote) Fill(a *ecdsa.PrivateKey, u [32]byte) error {
 // is the current round of consensus. blockHash identifies the current head of
 // the chain (selected branch)
 func (q *Quote) EnrolIdentity(
-	a *ecdsa.PrivateKey, chainID [32]byte, nodeid [32]byte, round *big.Int, blockHash [32]byte) error {
+	a *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round *big.Int, blockHash Hash) error {
 	e := EnrolmentBinding{
 		ChainID: chainID, NodeID: nodeid, Round: round, BlockHash: blockHash}
 	u, err := e.U()
@@ -136,16 +136,16 @@ func (q *Quote) EnrolIdentity(
 // EnrolmentBinding is rlp encoded, hashed and signed to introduce NodeID as a
 // member.
 type EnrolmentBinding struct {
-	ChainID   [32]byte // ChainID is EIP-rororo/extraData of Block0
-	NodeID    [32]byte // NodeID is defined by ethereum as keccak 256 ( PublicKey X || Y )
+	ChainID   Hash     // ChainID is EIP-rororo/extraData of Block0
+	NodeID    Hash     // NodeID is defined by ethereum as keccak 256 ( PublicKey X || Y )
 	Round     *big.Int // Round is the consensus round
-	BlockHash [32]byte // BlockHash is the block hash for the head of the selected chain branch
+	BlockHash Hash     // BlockHash is the block hash for the head of the selected chain branch
 }
 
 // U encodes the userdata hash to sign for the enrolment.
-func (e *EnrolmentBinding) U() ([32]byte, error) {
+func (e *EnrolmentBinding) U() (Hash, error) {
 
-	u := [32]byte{}
+	u := Hash{}
 	b, err := RlpEncodeToBytes(e)
 	if err != nil {
 		return u, err
@@ -158,18 +158,19 @@ func (e *EnrolmentBinding) U() ([32]byte, error) {
 // attested userdata hash. For a genesis enrolment, that is just the nodeid
 // directly. For operational enrolments, obtain u by filling in the
 // EnrolementBinding type and calling U()
-func (q *Quote) RecoverPublic(u [32]byte) (*ecdsa.PublicKey, error) {
+func (q *Quote) RecoverPublic(u Hash) (*ecdsa.PublicKey, error) {
 	return RecoverPublic(u[:], q[:])
 }
 
 // RecoverID recovers the attestors identity from the signature and the
 // identity (public key) of the quoted node
-func (q *Quote) RecoverID(u [32]byte) ([32]byte, error) {
+func (q *Quote) RecoverID(u Hash) (Hash, error) {
+	// XXX: TODO think Keccak256 call is wrong here, we just want u[:] directly
 	p, err := Ecrecover(Keccak256(u[:]), q[:])
 	if err != nil {
-		return [32]byte{}, err
+		return Hash{}, err
 	}
-	id := [32]byte{}
+	id := Hash{}
 	copy(id[:], Keccak256(p[1:65]))
 	return id, nil
 }
