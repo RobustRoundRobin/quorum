@@ -787,6 +787,13 @@ var (
 		Value: "",
 	}
 
+	// Quorum - added configurable call timeout for execution of calls
+	EVMCallTimeOutFlag = cli.IntFlag{
+		Name:  "vm.calltimeout",
+		Usage: "Timeout duration in seconds for message call execution without creating a transaction. Value 0 means no timeout.",
+		Value: 5,
+	}
+
 	// Quorum
 	// immutability threshold which can be passed as a parameter at geth start
 	QuorumImmutabilityThreshold = cli.IntFlag{
@@ -1573,6 +1580,14 @@ func setRoRoRo(ctx *cli.Context, cfg *eth.Config) {
 	}
 }
 
+func setQuorumConfig(ctx *cli.Context, cfg *eth.Config) {
+	cfg.EVMCallTimeOut = time.Duration(ctx.GlobalInt(EVMCallTimeOutFlag.Name)) * time.Second
+
+	setIstanbul(ctx, cfg)
+	setRaft(ctx, cfg)
+	setRoRoRo(ctx, cfg)
+}
+
 // CheckExclusive verifies that only a single instance of the provided flags was
 // set by the user. Each flag might optionally be followed by a string type to
 // specialize it further.
@@ -1647,9 +1662,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 	setLes(ctx, cfg)
 
 	// Quorum
-	setIstanbul(ctx, cfg)
-	setRaft(ctx, cfg)
-	setRoRoRo(ctx, cfg)
+	setQuorumConfig(ctx, cfg)
 
 	if ctx.GlobalIsSet(SyncModeFlag.Name) {
 		cfg.SyncMode = *GlobalTextMarshaler(ctx, SyncModeFlag.Name).(*downloader.SyncMode)
