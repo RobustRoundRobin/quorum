@@ -11,7 +11,6 @@ import (
 // NodeID is Keccak256 (Pub.X || Pub.Y )
 // In contexts where we have the id and a signature, we can recover the pub key
 // of the signer using Ecrecover
-
 func Pub2NodeIDBytes(pub *ecdsa.PublicKey) []byte {
 	buf := make([]byte, 64)
 	math.ReadBits(pub.X, buf[:32])
@@ -25,13 +24,19 @@ func Pub2NodeID(pub *ecdsa.PublicKey) Hash {
 	return h
 }
 
+func (h Hash) Address() Address {
+	a := Address{}
+	copy(a[:], h[12:])
+	return a
+}
+
 // SignerPub recovers the public key that signed h
-func SignerPub(h Hash, sig []byte) (*ecdsa.PublicKey, error) {
+func (h Hash) SignerPub(sig []byte) (*ecdsa.PublicKey, error) {
 	return RecoverPublic(h[:], sig)
 }
 
-func SignerNodeID(h Hash, sig []byte) (Hash, error) {
-	pub, err := RecoverPublic(h[:], sig)
+func (h Hash) SignerNodeID(sig []byte) (Hash, error) {
+	pub, err := h.SignerPub(sig)
 	if err != nil {
 		return Hash{}, err
 	}
@@ -39,7 +44,7 @@ func SignerNodeID(h Hash, sig []byte) (Hash, error) {
 }
 
 // Recover the enode id for the signer of the hash
-func SignerEnodeID(h Hash, sig []byte) ([]byte, error) {
+func (h Hash) SignerEnodeID(sig []byte) ([]byte, error) {
 	pub, err := RecoverPublic(h[:], sig)
 	if err != nil {
 		return nil, err

@@ -138,7 +138,7 @@ func genextra(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	decodedSignerNodeID, err := rororo.SignerNodeID(extraDecoded.IdentInit[0].U, extraDecoded.IdentInit[0].Q[:])
+	decodedSignerNodeID, err := extraDecoded.IdentInit[0].U.SignerNodeID(extraDecoded.IdentInit[0].Q[:])
 	if err != nil {
 		return err
 	}

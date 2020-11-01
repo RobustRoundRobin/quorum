@@ -3,6 +3,7 @@ package rororo
 import (
 	"crypto/ecdsa"
 	"errors"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -15,17 +16,28 @@ type Intent struct {
 	// ChainID is established in the extradata of the genesis block
 	ChainID Hash
 	// NodeID is Keccak256 ( PublicKey X || Y )
-	NodeID Hash
-	Parent Hash
-
-	// XXX: This may be redundant but lets have it for now.
-	// TxHash is the hash of the transactions. The paper suggests it is the
-	// direct hash, rather than hash of tx hashes.
+	NodeID      Hash
+	RoundNumber *big.Int
+	// ParentHash parent block hash
+	ParentHash Hash
+	// TxHash is the hash of the transactions (merkle root for block)
 	TxHash Hash
+}
+
+type Confirmation struct {
+	ChainID    Hash
+	EndorserID Hash // NodeID of endorser
+	IntentHash Hash
 }
 
 type SignedIntent struct {
 	Intent
+	// Sig is the ecdsa signature the [R || S || V] format
+	Sig [65]byte
+}
+
+type SignedConfirmation struct {
+	Confirmation
 	// Sig is the ecdsa signature the [R || S || V] format
 	Sig [65]byte
 }
@@ -79,7 +91,6 @@ func (i *SignedIntent) DecodeVerify(s *rlp.Stream) ([]byte, error) {
 	if b, err = s.Bytes(); err != nil {
 		return nil, err
 	}
-
 	copy(i.Sig[:], b)
 
 	pub, err := Ecrecover(h, b)

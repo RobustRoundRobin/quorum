@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -16,35 +15,57 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
+	"golang.org/x/crypto/sha3"
 )
 
 var (
 	// Uncles not relevant outside of PoW
-	errInvalidUncleHash = errors.New("non empty uncle hash")
-	errNoGenesisHeader  = errors.New("failed to get genesis header")
+	errInvalidUncleHash    = errors.New("non empty uncle hash")
+	errNoGenesisHeader     = errors.New("failed to get genesis header")
+	errEndorsersNotQuorate = errors.New("insufficient endorsers online")
+	errP2PMsgInvalidCode   = errors.New("recieved p2p.Msg with unsported code")
+	errRMsgInvalidCode     = errors.New("recevived RMsg with invalid code")
+	errEngineStopped       = errors.New("consensus not running")
+	nilUncleHash           = types.CalcUncleHash(nil) // Always Keccak256(RLP([])) as uncles are meaningless outside of PoW.
 )
 
 const (
 	NewBlockMsg = 0x07
-	rororoMsg   = 0x11
+
+	RoRoRoExtraVanity = 32
+	rororoMsg         = 0x11
 
 	// TODO: probably want this to be driven by Nc, Ne configuration
 	lruPeers    = 100 + 6*2
 	lruMessages = 1024
 )
 
+// RMsgCode identifies the rororo message type. rororoMsg identifies rororo's
+// message type to the devp2p layer as being consensus engine specific. Once
+// that outer message is delivered to rororo, RMsgCode is how rororo
+// differentiates each of its supported message payloads.
+type RMsgCode uint
+
+const (
+	RMsgInvalid RMsgCode = iota
+	RMsgIntent
+	RMsgConfirm
+)
+
+type RMsg struct {
+	Code RMsgCode
+	Raw  rlp.RawValue
+}
+
 // API is a user facing RPC API to dump Istanbul state
 type API struct {
 	chain  consensus.ChainReader
 	rororo *engine
 }
-
-// eng* types can be sent at any tome the the engines main channel.
-// engStop
-type engStop struct{}
 
 // engine implements consensus.Engine using Robust Round Robin consensus
 // https://arxiv.org/abs/1804.07391
@@ -61,6 +82,9 @@ type engine struct {
 
 	broadcaster consensus.Broadcaster
 
+	// must be held for any interaction with ARCCache *Messages members
+	messagingMu sync.RWMutex
+
 	// Track which messages we have sent or received. We do not re-gossip
 	// these. (IBFT calls these 'recentMessages'). We maintain a 2 level arc
 	// here, for each of lruPeers we have an lru of recentley gossiped
@@ -71,8 +95,27 @@ type engine struct {
 	// not re-broadcast these. We do not re post these locally.
 	selfMessages *lru.ARCCache
 
+	runningMu sync.RWMutex // hold read lock if checking 'runningCh is nil'
 	runningWG sync.WaitGroup
+
+	// runningCh is passed as tthe input channel to the engine run() method.
+	// The run method assumes the ownership of all pointer values sent to this
+	// channel.
 	runningCh chan interface{} // must be one of the Eng* types
+
+	roundNumberC  *sync.Cond
+	roundNumberMu sync.RWMutex // is held by roundNumberC
+	roundNumber   *big.Int
+
+	intentMu sync.Mutex
+	sealTask *engSealTask
+	intent   *pendingIntent
+}
+
+func (e *engine) IsRunning() bool {
+	e.runningMu.RLock()
+	defer e.runningMu.RUnlock()
+	return e.runningCh != nil
 }
 
 // New create rororo consensus engine
@@ -91,41 +134,85 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 		db:           db,
 		peerMessages: peerMessages,
 		selfMessages: selfMessages,
+
+		// Broadcast is called on every round change
+		roundNumberMu: sync.RWMutex{},
+		roundNumber:   big.NewInt(0),
 	}
+	e.roundNumberC = sync.NewCond(&e.roundNumberMu)
 
 	return e
 }
 
-// Gossip the message to the provided peers, skipping self.
-func (e *engine) Gossip(self common.Address, peers map[common.Address]consensus.Peer, msg []byte) error {
+func (e *engine) NewChainHead() error {
+	e.logger.Info("RoRoRo NewChainHead")
+	return ErrNotImplemented
+}
 
-	// XXX: todo the IBFT implementation rlp encoded msg before taking the
-	// hash. Unless it was required to cannonicalise the bytes, I can't see any
-	// reason for that. Lets find out ...
-	hash := Keccak256(msg)
+// HandleMsg handles a message from peer
+func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) {
 
-	for peerAddr, peer := range peers {
+	var err error
 
-		if peerAddr == self {
-			e.logger.Info("skipping self")
-			continue
-		}
-
-		var msgs *lru.ARCCache
-		if i, ok := e.peerMessages.Get(peerAddr); ok {
-			msgs, _ = i.(*lru.ARCCache)
-			if _, k := msgs.Get(hash); k {
-				// have already sent the message to, or received it from, this peer
-				continue
-			}
-		} else {
-			msgs, _ = lru.NewARC(lruMessages)
-		}
-		msgs.Add(hash, true)
-		e.peerMessages.Add(peerAddr, msgs)
-		go peer.Send(rororoMsg, msg)
+	if data.Code != rororoMsg {
+		return false, nil
 	}
-	return nil
+
+	if !e.IsRunning() {
+		return true, errEngineStopped
+	}
+
+	rmsg := &RMsg{}
+	if err = data.Decode(rmsg); err != nil {
+		return true, err
+	}
+
+	hash := Keccak256Hash(rmsg.Raw)
+	e.logger.Debug("RoRoRo messaging handling msg", "hash", hex.EncodeToString(hash[:]))
+
+	if seen := e.updateInboundMsgTracking(peerAddr, hash); seen {
+		return true, nil
+	}
+
+	switch rmsg.Code {
+	case RMsgIntent:
+		si := &SignedIntent{}
+		if err = rlp.DecodeBytes(rmsg.Raw, si); err != nil {
+			return true, err
+		}
+		e.logger.Info("RoRoRo SignedIntent",
+			"nodeid", hex.EncodeToString(si.NodeID[:]), "round", si.RoundNumber,
+			"parent", hex.EncodeToString(si.ParentHash[:]))
+
+		return true, nil
+
+	default:
+		return true, errRMsgInvalidCode
+	}
+}
+
+// updateInboundMsgTracking updates the tracking of messages inbound from peers
+func (e *engine) updateInboundMsgTracking(peerAddr common.Address, hash Hash) bool {
+	// keep track of messages seen from this peer recently
+	e.messagingMu.Lock()
+	defer e.messagingMu.Unlock()
+
+	var msgs *lru.ARCCache
+	if i, ok := e.peerMessages.Get(peerAddr); ok {
+		msgs, _ = i.(*lru.ARCCache)
+	} else {
+		msgs, _ = lru.NewARC(lruMessages)
+		e.peerMessages.Add(peerAddr, msgs)
+	}
+	msgs.Add(hash, true)
+
+	// If we have seen this message, do not handle it again.
+	var seen bool
+	if _, seen = e.selfMessages.Get(hash); !seen {
+		e.selfMessages.Add(hash, true)
+	}
+	return seen
+
 }
 
 // SetBroadcaster implements consensus.Handler.SetBroadcaster
@@ -135,10 +222,18 @@ func (e *engine) SetBroadcaster(broadcaster consensus.Broadcaster) {
 }
 
 func (e *engine) stop() {
+
+	e.runningMu.Lock()
 	if e.runningCh != nil {
+
 		close(e.runningCh)
 		e.runningCh = nil
+		e.runningMu.Unlock()
+
 		e.runningWG.Wait()
+
+	} else {
+		e.runningMu.Unlock()
 	}
 }
 
@@ -146,30 +241,23 @@ func (e *engine) startRound() error {
 	return nil
 }
 
-func (e *engine) run(
-	chain consensus.ChainReader,
-	currentBlock func() *types.Block,
-	hasBadBlock func(hash common.Hash) bool, ch <-chan interface{}) error {
-
-	defer e.runningWG.Done()
-	e.runningWG.Add(1)
-
-	roundTick := time.NewTicker(time.Duration(e.config.RoundLength) * time.Millisecond)
-	// Endorsed leader candidates will broadcast the new block at the end of
-	// the round according to their tickers. We reset the ticker each time we
-	// see a new block confirmed. This will cause all participants to losely
-	// align on the same time window for each round. In the absence of
-	// comminication, each node will simply initiate a new round.
-
-	for {
-		select {
-		case i := <-ch:
-			e.logger.Info("rororo engine.run recieved: %v", i)
-		case <-roundTick.C:
-			e.logger.Debug("rororo engine.run round expired")
-			// h := chain.CurrentHeader()
-		}
+// NotifyRoundChange send val to the notify channel when the round number
+// changes (it does not care if it increases or decreases, only that it
+// changes)
+func (e *engine) NotifyRoundChange(notify chan<- interface{}, val interface{}) {
+	e.roundNumberC.L.Lock()
+	currentRound := big.NewInt(0).Set(e.roundNumber)
+	for e.roundNumber.Cmp(currentRound) == 0 {
+		e.roundNumberC.Wait()
 	}
+	e.roundNumberC.L.Unlock()
+	notify <- val
+}
+
+func (e *engine) RoundNumber() *big.Int {
+	e.roundNumberMu.RLock()
+	defer e.roundNumberMu.RUnlock()
+	return big.NewInt(0).Set(e.roundNumber)
 }
 
 func (e *engine) Start(
@@ -189,7 +277,12 @@ func (e *engine) Start(
 		return err
 	}
 
-	signerNodeID, err := SignerNodeID(e.genesisEx.IdentInit[0].U, e.genesisEx.IdentInit[0].Q[:])
+	signerPub, err := e.genesisEx.IdentInit[0].U.SignerPub(e.genesisEx.IdentInit[0].Q[:])
+	signerAddr := crypto.PubkeyToAddress(*signerPub)
+	fmt.Printf("signer-addr: %s\n", hex.EncodeToString(signerAddr[:]))
+	fmt.Printf("signer-addr: %s\n", hex.EncodeToString(e.genesisEx.IdentInit[0].U[12:]))
+
+	signerNodeID, err := e.genesisEx.IdentInit[0].U.SignerNodeID(e.genesisEx.IdentInit[0].Q[:])
 	if err != nil {
 		return err
 	}
@@ -273,6 +366,9 @@ func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) e
 // rules of a particular engine. The changes are executed inline.
 func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) error {
 	e.logger.Info("RoRoRo Prepare")
+	extra := make([]byte, RoRoRoExtraVanity)
+	copy(extra, header.Extra)
+	header.Extra = extra
 	return nil
 }
 
@@ -285,6 +381,9 @@ func (e *engine) Finalize(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header) {
 	e.logger.Info("RoRoRo Finalize")
+	// No block rewards in rororo, so the state remains as is and uncles are dropped
+	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	header.UncleHash = nilUncleHash
 }
 
 // FinalizeAndAssemble runs any post-transaction state modifications (e.g. block
@@ -292,10 +391,19 @@ func (e *engine) Finalize(
 //
 // Note: The block header and state database might be updated to reflect any
 // consensus rules that happen at finalization (e.g. block rewards).
-func (e *engine) FinalizeAndAssemble(chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
+func (e *engine) FinalizeAndAssemble(
+	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+
 	e.logger.Info("RoRoRo FinalizeAndAssemble")
-	return nil, ErrNotImplemented
+	// No block rewards in rororo, so the state remains as is and uncles are dropped
+	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	header.UncleHash = nilUncleHash
+
+	block := types.NewBlock(header, txs, nil, receipts)
+
+	// Assemble and return the final block for sealing
+	return block, nil
 }
 
 // Seal generates a new sealing request for the given input block and pushes
@@ -304,14 +412,47 @@ func (e *engine) FinalizeAndAssemble(chain consensus.ChainReader, header *types.
 // Note, the method returns immediately and will send the result async. More
 // than one result may also be returned depending on the consensus algorithm.
 func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
-	e.logger.Info("RoRoRo Seal")
-	return ErrNotImplemented
+	h := sealHash(block.Header())
+	e.logger.Info("RoRoRo Seal", "bn", block.Number(), "#s", hex.EncodeToString(h[:]))
+	// XXX: If we have a intent and the required confirmations for the block,
+	// sign it. In ethhash, this is where the PoW happens
+
+	e.runningCh <- &engSealTask{
+		RoundNumber: e.RoundNumber(),
+		Block:       block, Results: results, Stop: stop}
+
+	// roundChange := make(chan interface{})
+	// go e.NotifyRoundChange(roundChange, nil)
+	// go func() {
+	// 	select {
+	// 	case <-stop:
+	// 		return
+	// 	case <-roundChange:
+	// 		return
+	// 	}
+	// }()
+
+	return nil
 }
 
-// SealHash returns the hash of a block prior to it being sealed.
+// SealHash returns the hash of a block prior to it being sealed. This hash
+// excludes the rororo extra data beyond the fixed 32 byte vanity. The various
+// elements in the rororo extra data carry their own signatures over data which
+// bind the elements to the block being sealed. If the extra data on the header
+// is < RoRoRoExtraVanity bytes long this function will panic (to avoid
+// accidentally creating the same hash for different blocks).
 func (e *engine) SealHash(header *types.Header) common.Hash {
 	e.logger.Info("RoRoRo SealHash")
-	return common.Hash{}
+	return sealHash(header)
+}
+
+func sealHash(header *types.Header) common.Hash {
+	newHeader := types.CopyHeader(header)
+	newHeader.Extra = newHeader.Extra[:RoRoRoExtraVanity]
+	hasher := sha3.NewLegacyKeccak256()
+	hash := common.Hash{}
+	hasher.Sum(hash[:0])
+	return hash
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty

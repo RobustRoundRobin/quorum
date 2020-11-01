@@ -19,6 +19,9 @@ import (
 
 type Hash [32]byte
 
+// Address is the ethereum style right most 20 bytes of Keccak256 (pub.X || pub.Y )
+type Address [20]byte
+
 func RlpEncodeToBytes(v interface{}) ([]byte, error) {
 	return rlp.EncodeToBytes(v)
 }
@@ -29,6 +32,12 @@ func RlpDecodeBytes(b []byte, v interface{}) error {
 
 func Keccak256(b ...[]byte) []byte {
 	return crypto.Keccak256(b...)
+}
+
+func Keccak256Hash(b ...[]byte) Hash {
+	h := Hash{}
+	copy(h[:], Keccak256(b...))
+	return h
 }
 
 func Sign(h []byte, k *ecdsa.PrivateKey) ([]byte, error) {
