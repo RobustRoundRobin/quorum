@@ -162,8 +162,12 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 		return true, errEngineStopped
 	}
 
+	var msg []byte
+	if err = data.Decode(&msg); err != nil {
+		return true, err
+	}
 	rmsg := &RMsg{}
-	if err = data.Decode(rmsg); err != nil {
+	if err = rlp.DecodeBytes(msg, rmsg); err != nil {
 		return true, err
 	}
 
@@ -176,12 +180,14 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 
 	switch rmsg.Code {
 	case RMsgIntent:
+
 		si := &SignedIntent{}
 		if err = rlp.DecodeBytes(rmsg.Raw, si); err != nil {
 			return true, err
 		}
-		e.logger.Info("RoRoRo SignedIntent",
-			"nodeid", hex.EncodeToString(si.NodeID[:]), "round", si.RoundNumber,
+		e.logger.Info("RoRoRo Recieved SignedIntent",
+			"round", si.RoundNumber,
+			"nodeid", hex.EncodeToString(si.NodeID[:]),
 			"parent", hex.EncodeToString(si.ParentHash[:]))
 
 		return true, nil

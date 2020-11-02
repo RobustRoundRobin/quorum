@@ -212,6 +212,9 @@ func (n *Node) ValidateComplete() error {
 
 // String returns the text representation of the record.
 func (n *Node) String() string {
+	if n == nil {
+		return "nil"
+	}
 	if isNewV4(n) {
 		return n.URLv4() // backwards-compatibility glue for NewV4 nodes
 	}

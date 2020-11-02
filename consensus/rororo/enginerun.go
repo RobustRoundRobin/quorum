@@ -309,7 +309,7 @@ func (e *engine) Gossip(self common.Address, peers map[common.Address]consensus.
 	// XXX: todo the IBFT implementation rlp encoded msg before taking the
 	// hash. Unless it was required to cannonicalise the bytes, I can't see any
 	// reason for that. Lets find out ...
-	hash := Keccak256(msg)
+	hash := Keccak256Hash(msg)
 	e.logger.Debug("RoRoRo messaging broadcasting msg", "hash", hex.EncodeToString(hash[:]))
 
 	for peerAddr, peer := range peers {
@@ -321,7 +321,7 @@ func (e *engine) Gossip(self common.Address, peers map[common.Address]consensus.
 
 		var msgs *lru.ARCCache
 		if i, ok := e.peerMessages.Get(peerAddr); ok {
-			msgs, _ = i.(*lru.ARCCache)
+			msgs = i.(*lru.ARCCache) // panic if we have put the wrong type in the cache
 			if _, k := msgs.Get(hash); k {
 				// have already sent the message to, or received it from, this peer
 				continue
