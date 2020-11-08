@@ -17,13 +17,13 @@ func TestIntentVerify(t *testing.T) {
 
 	i := &SignedIntent{
 		Intent: Intent{
-			ChainID: Hash{1, 2}, NodeID: Hash{3, 4}, Parent: Hash{5, 6}},
+			ChainID: Hash{1, 2}, NodeID: Hash{3, 4}, ParentHash: Hash{5, 6}},
 	}
 
-	raw, err := i.EncodeSigned(k)
+	raw, err := i.SignedEncode(k)
 
 	iv := &SignedIntent{}
 	s := rlp.NewStream(bytes.NewReader([]byte(raw)), 0)
-	_, err = iv.DecodeVerify(s)
+	_, err = iv.DecodeSigned(s)
 	require.Nil(err)
 }

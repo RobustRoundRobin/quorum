@@ -3,6 +3,7 @@ package rororo
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"fmt"
 
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -16,6 +17,15 @@ func Pub2NodeIDBytes(pub *ecdsa.PublicKey) []byte {
 	math.ReadBits(pub.X, buf[:32])
 	math.ReadBits(pub.Y, buf[32:])
 	return crypto.Keccak256(buf)
+}
+
+func PubBytes2NodeID(pub []byte) (Hash, error) {
+	if len(pub) != 65 {
+		return Hash{}, fmt.Errorf("raw pubkey must be 64 bytes long")
+	}
+	h := Hash{}
+	copy(h[:], Keccak256(pub[1:]))
+	return h, nil
 }
 
 func Pub2NodeID(pub *ecdsa.PublicKey) Hash {

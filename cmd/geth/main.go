@@ -165,6 +165,7 @@ var (
 		utils.IstanbulBlockPeriodFlag,
 		utils.RoRoRoCandidatesFlag,
 		utils.RoRoRoEndorsersFlag,
+		utils.RoRoRoEndorsersQuorumFlag,
 		utils.PluginSettingsFlag,
 		utils.PluginSkipVerifyFlag,
 		utils.PluginLocalVerifyFlag,

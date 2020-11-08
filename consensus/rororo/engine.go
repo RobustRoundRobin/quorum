@@ -1,6 +1,7 @@
 package rororo
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"errors"
@@ -31,6 +32,9 @@ var (
 	errRMsgInvalidCode     = errors.New("recevived RMsg with invalid code")
 	errEngineStopped       = errors.New("consensus not running")
 	nilUncleHash           = types.CalcUncleHash(nil) // Always Keccak256(RLP([])) as uncles are meaningless outside of PoW.
+
+	emptyNonce = types.BlockNonce{}
+	bigOne     = big.NewInt(1)
 )
 
 const (
@@ -79,7 +83,9 @@ type engine struct {
 	db         ethdb.Database
 	genesisEx  GenesisExtraData
 	nodeID     Hash // derived from privateKey
+	nodeAddr   common.Address
 
+	chain       consensus.ChainReader
 	broadcaster consensus.Broadcaster
 
 	// must be held for any interaction with ARCCache *Messages members
@@ -110,6 +116,15 @@ type engine struct {
 	intentMu sync.Mutex
 	sealTask *engSealTask
 	intent   *pendingIntent
+	// These get updated each round on all nodes without regard to which are
+	// leaders/endorsers or participants.
+	candidates map[common.Address]bool
+	endorsers  map[common.Address]bool
+	quorum     int
+}
+
+func (e *engine) HexNodeID() string {
+	return hex.EncodeToString(e.nodeID[:])
 }
 
 func (e *engine) IsRunning() bool {
@@ -129,7 +144,7 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 		config:       config,
 		privateKey:   privateKey,
 		nodeID:       Pub2NodeID(&privateKey.PublicKey),
-		address:      crypto.PubkeyToAddress(privateKey.PublicKey),
+		nodeAddr:     crypto.PubkeyToAddress(privateKey.PublicKey),
 		logger:       logger,
 		db:           db,
 		peerMessages: peerMessages,
@@ -181,14 +196,30 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 	switch rmsg.Code {
 	case RMsgIntent:
 
-		si := &SignedIntent{}
-		if err = rlp.DecodeBytes(rmsg.Raw, si); err != nil {
+		si := &engSignedIntent{ReceivedAt: data.ReceivedAt}
+
+		if si.Pub, err = si.DecodeSigned(NewBytesStream([]byte(rmsg.Raw))); err != nil {
+			e.logger.Info("RoRoRo Intent decodeverify failed", "err", err)
 			return true, err
 		}
-		e.logger.Info("RoRoRo Recieved SignedIntent",
-			"round", si.RoundNumber,
-			"nodeid", hex.EncodeToString(si.NodeID[:]),
-			"parent", hex.EncodeToString(si.ParentHash[:]))
+
+		e.runningCh <- si
+
+		return true, nil
+
+	case RMsgConfirm:
+
+		sc := &engSignedEndorsement{ReceivedAt: data.ReceivedAt}
+
+		r := bytes.NewReader([]byte(rmsg.Raw))
+		s := rlp.NewStream(r, uint64(len(rmsg.Raw)))
+
+		if sc.Pub, err = sc.DecodeSigned(s); err != nil {
+			e.logger.Info("RoRoRo Endorsement decodeverify failed", "err", err)
+			return true, err
+		}
+
+		e.runningCh <- sc
 
 		return true, nil
 
@@ -305,7 +336,7 @@ func (e *engine) Start(
 	}
 
 	e.runningCh = make(chan interface{})
-	go e.run(chain, currentBlock, hasBadBlock, e.runningCh)
+	go e.run(currentBlock, hasBadBlock, e.runningCh)
 
 	return nil
 }
@@ -320,7 +351,20 @@ func (e *engine) Stop() error {
 // engine is based on signatures.
 func (e *engine) Author(header *types.Header) (common.Address, error) {
 	e.logger.Info("RoRoRo Author")
-	return common.Address{}, ErrNotImplemented
+
+	_, sealerID, _, err := e.decodeHeaderSeal(header)
+	if err != nil {
+		return common.Address{}, err
+	}
+
+	sealingNodeAddr := common.Address(sealerID.Address())
+
+	if sealingNodeAddr == e.nodeAddr {
+		e.logger.Info("RoRoRo sealed by self", "address", sealingNodeAddr)
+	} else {
+		e.logger.Info("RoRoRo sealed by", "address", sealingNodeAddr)
+	}
+	return sealingNodeAddr, nil
 }
 
 // VerifyHeader checks whether a header conforms to the consensus rules of a
@@ -328,18 +372,7 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 // via the VerifySeal method.
 func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header, seal bool) error {
 	e.logger.Info("RoRoRo VerifyHeader")
-	return e.verifyCascadingFields(chain, header)
-}
-
-// verifyCascadingFields verifies all the header fields that are not standalone,
-// rather depend on a batch of previous headers.
-func (e *engine) verifyCascadingFields(chain consensus.ChainReader, header *types.Header) error {
-	number := header.Number.Uint64()
-	// The genesis block is the always valid dead-end
-	if number == 0 {
-		return nil
-	}
-	return ErrNotImplemented
+	return e.verifyBranchHeaders(chain, header, nil)
 }
 
 // VerifyHeaders is similar to VerifyHeader, but verifies a batch of headers
@@ -348,7 +381,30 @@ func (e *engine) verifyCascadingFields(chain consensus.ChainReader, header *type
 // the input slice).
 func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
 	e.logger.Info("RoRoRo VerifyHeaders")
-	return nil, nil
+	abort := make(chan struct{})
+	results := make(chan error, len(headers))
+	go func() {
+		errored := false
+		for i, header := range headers {
+			var err error
+			if errored {
+				err = consensus.ErrUnknownAncestor
+			} else {
+				err = e.verifyBranchHeaders(chain, header, headers[:i])
+			}
+
+			if err != nil {
+				errored = true
+			}
+
+			select {
+			case <-abort:
+				return
+			case results <- err:
+			}
+		}
+	}()
+	return abort, results
 }
 
 // VerifyUncles verifies that the given block's uncles conform to the consensus
@@ -365,16 +421,23 @@ func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 // the consensus rules of the given engine.
 func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
 	e.logger.Info("RoRoRo VerifySeal")
-	return ErrNotImplemented
+	if _, err := e.verifyHeader(chain, header); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Prepare initializes the consensus fields of a block header according to the
 // rules of a particular engine. The changes are executed inline.
 func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) error {
 	e.logger.Info("RoRoRo Prepare")
+
+	// Start witht the default vanity data and nothing else.
 	extra := make([]byte, RoRoRoExtraVanity)
 	copy(extra, header.Extra)
 	header.Extra = extra
+	// this is just the block number for rororo
+	header.Difficulty = header.Number
 	return nil
 }
 
@@ -462,10 +525,12 @@ func sealHash(header *types.Header) common.Hash {
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
-// that a new block should have.
+// that a new block should have. For rororo this is just the round number
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
 	e.logger.Info("RoRoRo CalcDifficulty")
-	return nil
+	// return e.RoundNumber() - no, this doesn't work unless we sync the rounds
+	// properly
+	return parent.Number.Add(parent.Number, bigOne)
 }
 
 // APIs returns the RPC APIs this consensus engine provides.

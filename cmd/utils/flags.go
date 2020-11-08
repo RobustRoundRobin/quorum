@@ -895,6 +895,11 @@ var (
 		Usage: "Number of endorsers to use for each leadership round",
 		Value: eth.DefaultConfig.RoRoRo.Endorsers,
 	}
+	RoRoRoEndorsersQuorumFlag = cli.Uint64Flag{
+		Name:  "rororo.endorsersquorum",
+		Usage: "Number of endorsers required to confirm a leaders intent",
+		Value: eth.DefaultConfig.RoRoRo.EndorsersQuorum,
+	}
 )
 
 // MakeDataDir retrieves the currently requested data directory, terminating
@@ -1572,12 +1577,24 @@ func setRaft(ctx *cli.Context, cfg *eth.Config) {
 }
 
 func setRoRoRo(ctx *cli.Context, cfg *eth.Config) {
+
+	if ctx.GlobalIsSet(RoRoRoConfirmTimeoutFlag.Name) {
+		cfg.RoRoRo.ConfirmTimeout = ctx.GlobalUint64(RoRoRoConfirmTimeoutFlag.Name)
+	}
+	if ctx.GlobalIsSet(RoRoRoRoundLengthFlag.Name) {
+		cfg.RoRoRo.RoundLength = ctx.GlobalUint64(RoRoRoRoundLengthFlag.Name)
+	}
+
 	if ctx.GlobalIsSet(RoRoRoCandidatesFlag.Name) {
 		cfg.RoRoRo.Candidates = ctx.GlobalUint64(RoRoRoCandidatesFlag.Name)
 	}
 	if ctx.GlobalIsSet(RoRoRoEndorsersFlag.Name) {
 		cfg.RoRoRo.Endorsers = ctx.GlobalUint64(RoRoRoEndorsersFlag.Name)
 	}
+	if ctx.GlobalIsSet(RoRoRoEndorsersQuorumFlag.Name) {
+		cfg.RoRoRo.EndorsersQuorum = ctx.GlobalUint64(RoRoRoEndorsersQuorumFlag.Name)
+	}
+
 }
 
 func setQuorumConfig(ctx *cli.Context, cfg *eth.Config) {
