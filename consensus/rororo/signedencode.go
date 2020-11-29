@@ -13,8 +13,10 @@ var (
 	ErrSignedDecodeSignedFailed = errors.New("decoding signed rlp struct failed")
 )
 
-// verifyNodeSig verify that sig was produced by the public key for the node
-// identified by nodeID
+// verifyNodeSig verifies that sig was produced by the public key for the node
+// identified by nodeID. The nodeID is the hash of the nodes public key. So
+// rather that a typical verify where the r co-ords are compared, we recover
+// the full public key and hash it to get the node id of the signer.
 func verifyNodeSig(nodeID Hash, sig []byte, v interface{}) (bool, error) {
 
 	var err error
@@ -72,6 +74,9 @@ func signedEncode(k *ecdsa.PrivateKey, v interface{}) ([65]byte, rlp.RawValue, e
 	return sig, rlp.RawValue(b), nil
 }
 
+// decodeSigned decodes a hash and its 65 byte ecdsa signture and recovers the
+// puplic key. In this implementation, the recovered public key is the RRR long
+// term identity and we pretty much always want that to hand.
 func decodeSigned(s *rlp.Stream) ([65]byte, []byte, []byte, error) {
 
 	var err error
@@ -83,7 +88,7 @@ func decodeSigned(s *rlp.Stream) ([65]byte, []byte, []byte, error) {
 	}
 
 	// First item is the full encoding of the signed item, get the bytes and
-	// verify the sig using the hash of the encoded bytes
+	// recover the pub key using the hash of the encoded bytes
 	var body []byte
 	if body, err = s.Raw(); err != nil {
 		return [65]byte{}, nil, nil, err
@@ -97,6 +102,7 @@ func decodeSigned(s *rlp.Stream) ([65]byte, []byte, []byte, error) {
 	}
 	copy(sig[:], b)
 
+	// recover the public key
 	pub, err = Ecrecover(h, b)
 	if err != nil {
 		return [65]byte{}, nil, nil, err

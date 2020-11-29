@@ -289,7 +289,7 @@ func (w *worker) start() {
 	case consensus.Istanbul:
 		e.Start(w.chain, w.chain.CurrentBlock, w.chain.HasBadBlock)
 	case consensus.RoRoRo:
-		e.Start(w.chain, w.chain.CurrentBlock, w.chain.HasBadBlock)
+		e.Start(w.chain)
 	}
 
 	w.startCh <- struct{}{}

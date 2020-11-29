@@ -11,10 +11,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -25,16 +27,31 @@ import (
 
 var (
 	// Uncles not relevant outside of PoW
-	errInvalidUncleHash    = errors.New("non empty uncle hash")
-	errNoGenesisHeader     = errors.New("failed to get genesis header")
-	errEndorsersNotQuorate = errors.New("insufficient endorsers online")
-	errP2PMsgInvalidCode   = errors.New("recieved p2p.Msg with unsported code")
-	errRMsgInvalidCode     = errors.New("recevived RMsg with invalid code")
-	errEngineStopped       = errors.New("consensus not running")
-	nilUncleHash           = types.CalcUncleHash(nil) // Always Keccak256(RLP([])) as uncles are meaningless outside of PoW.
+	errInvalidUncleHash        = errors.New("non empty uncle hash")
+	errNoGenesisHeader         = errors.New("failed to get genesis header")
+	errEndorsersNotQuorate     = errors.New("insufficient endorsers online")
+	errP2PMsgInvalidCode       = errors.New("recieved p2p.Msg with unsported code")
+	errRMsgInvalidCode         = errors.New("recevived RMsg with invalid code")
+	errIncompatibleChainReader = errors.New("chainreader missing required interfaces for RoRoRo")
+	errEngineStopped           = errors.New("consensus not running")
+	errNotEndorser             = errors.New("expected to be endorser")
+	errNotLeaderCandidate      = errors.New("expected to be leader candidate")
+	errIntentNotFromLeader     = errors.New("endorser disagrees with intents leadership")
+	errIntentSigInconsistent   = errors.New("The node id derived from the intent signature doesn't match the intent nodeid")
+	nilUncleHash               = types.CalcUncleHash(nil) // Always Keccak256(RLP([])) as uncles are meaningless outside of PoW.
 
 	emptyNonce = types.BlockNonce{}
 	bigOne     = big.NewInt(1)
+
+	// Difficulty is the measure of 'how hard' it is to extend the chain. For
+	// PoA, and RRR in particular, this is just an indicator of whose turn it
+	// is. Essentially it is always 'harder' for the peers that are currently
+	// leader candidates - as they must wait for endorsements. The peers whose
+	// turn it is to endorse don't actually publish blocks at all, but we have
+	// an endorser difficulty to make sure any transitory local data makes
+	// sense.
+	difficultyForCandidate = big.NewInt(2)
+	difficultyForEndorser  = big.NewInt(1)
 )
 
 const (
@@ -71,6 +88,22 @@ type API struct {
 	rororo *engine
 }
 
+type ChainSubscriber interface {
+	SubscribeChainEvent(ch chan<- core.ChainEvent) event.Subscription
+	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
+	SubscribeChainSideEvent(ch chan<- core.ChainSideEvent) event.Subscription
+}
+
+// RoRoRoChainReader the implementation of ChainReader passed to Start must
+// implement the RoRoRoChainReader interface. This is a run time check to avoid
+// import cycles on the core event types
+type RoRoRoChainReader interface {
+	consensus.ChainReader
+	ChainSubscriber
+	CurrentBlock() *types.Block
+	HasBadBlock(hash common.Hash) bool
+}
+
 // engine implements consensus.Engine using Robust Round Robin consensus
 // https://arxiv.org/abs/1804.07391
 type engine struct {
@@ -88,13 +121,16 @@ type engine struct {
 	chain       consensus.ChainReader
 	broadcaster consensus.Broadcaster
 
+	// Subscribed in Start, unsubscribed in Stop
+	chainHeadSub event.Subscription
+	chainHeadCh  chan core.ChainHeadEvent
+
 	// must be held for any interaction with ARCCache *Messages members
 	messagingMu sync.RWMutex
 
 	// Track which messages we have sent or received. We do not re-gossip
 	// these. (IBFT calls these 'recentMessages'). We maintain a 2 level arc
-	// here, for each of lruPeers we have an lru of recentley gossiped
-	// messages.
+	// here, for each of lruPeers we have an lru of recent messages.
 	peerMessages *lru.ARCCache
 
 	// Track which messages we have posted on our local processing queue. We do
@@ -104,10 +140,10 @@ type engine struct {
 	runningMu sync.RWMutex // hold read lock if checking 'runningCh is nil'
 	runningWG sync.WaitGroup
 
-	// runningCh is passed as tthe input channel to the engine run() method.
-	// The run method assumes the ownership of all pointer values sent to this
-	// channel.
-	runningCh chan interface{} // must be one of the Eng* types
+	// runningCh is passed as the input channel to the engine run() method.
+	// The run method assumes the ownership of all values sent to this channel.
+	// Handles all of the  eng* types and core.ChainHeadEvent
+	runningCh chan interface{}
 
 	roundNumberC  *sync.Cond
 	roundNumberMu sync.RWMutex // is held by roundNumberC
@@ -120,7 +156,8 @@ type engine struct {
 	// leaders/endorsers or participants.
 	candidates map[common.Address]bool
 	endorsers  map[common.Address]bool
-	quorum     int
+	// Number of endorsers required to confirm an intent.
+	quorum int
 }
 
 func (e *engine) HexNodeID() string {
@@ -147,6 +184,7 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 		nodeAddr:     crypto.PubkeyToAddress(privateKey.PublicKey),
 		logger:       logger,
 		db:           db,
+		chainHeadCh:  make(chan core.ChainHeadEvent),
 		peerMessages: peerMessages,
 		selfMessages: selfMessages,
 
@@ -159,9 +197,9 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 	return e
 }
 
+// NewBlockChain is ignored, we subscribe to the original ChainHeadEvent
 func (e *engine) NewChainHead() error {
-	e.logger.Info("RoRoRo NewChainHead")
-	return ErrNotImplemented
+	return nil
 }
 
 // HandleMsg handles a message from peer
@@ -228,8 +266,116 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 	}
 }
 
+// Send the message to the peer. If roundHorizon is true the message will be
+// re-sent if it has not already been sent on or after this round. Otherwise it
+// will only be sent if the message hash isn't in the ARU cache at all.
+// Typically the horizon should be the current round or nil. Note: the round is
+// a parameter to avoid taking the roundNumberMu in a potentially surprising
+// context.
+func (e *engine) Send(peerAddr common.Address, msg []byte, roundHorizon *big.Int) error {
+
+	msgHash := Keccak256Hash(msg)
+
+	peers := e.broadcaster.FindPeers(map[common.Address]bool{peerAddr: true})
+	if len(peers) != 1 {
+		return fmt.Errorf("RoRoRo no peer connection for received Intent")
+	}
+	peer := peers[peerAddr]
+	if peer == nil {
+		return fmt.Errorf("internal error, FindPeers returning unasked for peer")
+	}
+	return e.peerSend(peer, peerAddr, msg, msgHash, roundHorizon)
+}
+
+// Broadcast the message to the provided peers, skipping self. roundHorizon is
+// same as for Send
+func (e *engine) Broadcast(self common.Address, peers map[common.Address]consensus.Peer, msg []byte, roundHorizon *big.Int) error {
+
+	msgHash := Keccak256Hash(msg)
+	// e.logger.Debug("RoRoRo messaging broadcasting msg", "hash", hex.EncodeToString(msgHash[:]))
+
+	for peerAddr, peer := range peers {
+
+		if peerAddr == self {
+			e.logger.Info("skipping self")
+			continue
+		}
+
+		if err := e.peerSend(peer, peerAddr, msg, msgHash, roundHorizon); err != nil {
+			e.logger.Info("RoRoRo error sending msg", "err", err, "peer", peerAddr)
+		}
+	}
+	return nil
+}
+
+func (e *engine) peerSend(
+	peer consensus.Peer, peerAddr common.Address, msg []byte, msgHash Hash,
+	roundHorizon *big.Int,
+) error {
+
+	e.messagingMu.Lock()
+	defer e.messagingMu.Unlock()
+
+	var msgs *lru.ARCCache
+
+	if i, ok := e.peerMessages.Get(peerAddr); ok {
+		msgs = i.(*lru.ARCCache) // panic if we have put the wrong type in the cache
+		if ir, ok := msgs.Get(msgHash); ok {
+			if sentRound, ok := ir.(*big.Int); ok {
+				if sentRound.Cmp(roundHorizon) < 0 {
+					// sent < horizon means its forgotten.
+					return nil
+				}
+				// re-send, because its at or within the horizon
+				e.logger.Debug("RoRoRo re-send for peer", "peer", peerAddr.Hex(), "#msg", msgHash.Hex())
+			} else {
+				if roundHorizon == nil {
+					// The message has been seen before and we are not
+					// forgetting messages sent in earlier rounds. So we don't
+					// care that there is no record of the round that the
+					// message was sent on
+					return nil
+				}
+				// sentRound is the zero of ptr T, which is nil
+				// We don't know when it was sent. We act on what the caller
+				// *now*. Which is to be sure the message is sent this round.
+				// And then we ill set the sentRound for the next time.
+				e.logger.Debug("RoRoRo re-send for peer (prior msg round unknown)", "peer", peerAddr.Hex(), "#msg", msgHash.Hex())
+			}
+			// have already sent the message to, or received it from, this peer
+			return nil
+		}
+	} else {
+		msgs, _ = lru.NewARC(lruMessages)
+	}
+
+	// All of RRR consensus messages are sent with the horizon enabled. For
+	// other message kinds (none as yet) we can only apply the round horizon to
+	// messages that were most recently sent with the horzon enabled. If we send
+	// a message without the horizon then it will not be resent until the ARU
+	// cache limit is reached or until it is sent a again *with* the horizon.
+	// This strategy may theoretically cause redunant resends. In practice we
+	// don't expect this pattern of message sending. And we are not sensitive to
+	// duplicates for any RRR consensus messsages - everything is idempotent.
+	if roundHorizon == nil {
+		msgs.Add(msgHash, true)
+	} else {
+		msgs.Add(msgHash, roundHorizon)
+	}
+	e.peerMessages.Add(peerAddr, msgs)
+
+	// Send will error imediately on encoding problems. But otherwise it
+	// will block until the receiver consumes the message or the send times
+	// out. So we can not sensibly collect errors.
+	go peer.Send(rororoMsg, msg)
+	return nil
+}
+
 // updateInboundMsgTracking updates the tracking of messages inbound from peers
 func (e *engine) updateInboundMsgTracking(peerAddr common.Address, hash Hash) bool {
+
+	round := e.RoundNumber()
+
 	// keep track of messages seen from this peer recently
 	e.messagingMu.Lock()
 	defer e.messagingMu.Unlock()
@@ -260,6 +406,10 @@ func (e *engine) SetBroadcaster(broadcaster consensus.Broadcaster) {
 
 func (e *engine) stop() {
 
+	if e.chainHeadSub != nil { // we are called from Start
+		e.chainHeadSub.Unsubscribe()
+	}
+
 	e.runningMu.Lock()
 	if e.runningCh != nil {
 
@@ -272,10 +422,6 @@ func (e *engine) stop() {
 	} else {
 		e.runningMu.Unlock()
 	}
-}
-
-func (e *engine) startRound() error {
-	return nil
 }
 
 // NotifyRoundChange send val to the notify channel when the round number
@@ -298,9 +444,16 @@ func (e *engine) RoundNumber() *big.Int {
 }
 
 func (e *engine) Start(
-	chain consensus.ChainReader, currentBlock func() *types.Block, hasBadBlock func(hash common.Hash) bool) error {
+	reader consensus.ChainReader) error {
 	e.logger.Info("RoRoRo Start")
 	e.stop()
+
+	chain, ok := reader.(RoRoRoChainReader)
+	if !ok {
+		return errIncompatibleChainReader
+	}
+
+	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
 
 	// When Start is called we can be sure that everything we need is ready. So
 	// we process the genesis extra data here.
@@ -316,7 +469,7 @@ func (e *engine) Start(
 
 	signerPub, err := e.genesisEx.IdentInit[0].U.SignerPub(e.genesisEx.IdentInit[0].Q[:])
 	signerAddr := crypto.PubkeyToAddress(*signerPub)
-	fmt.Printf("signer-addr: %s\n", hex.EncodeToString(signerAddr[:]))
+	fmt.Printf("signer-addr: %s\n", signerAddr.Hex())
 	fmt.Printf("signer-addr: %s\n", hex.EncodeToString(e.genesisEx.IdentInit[0].U[12:]))
 
 	signerNodeID, err := e.genesisEx.IdentInit[0].U.SignerNodeID(e.genesisEx.IdentInit[0].Q[:])
@@ -327,7 +480,7 @@ func (e *engine) Start(
 	for _, en := range e.genesisEx.IdentInit {
 		if en.U == signerNodeID {
 			foundGenesisSigner = true
-			e.logger.Info("genesis", "signer nodeid", hex.EncodeToString(en.U[:]))
+			e.logger.Info("genesis", "signer nodeid", en.U.Hex())
 			break
 		}
 	}
@@ -336,7 +489,7 @@ func (e *engine) Start(
 	}
 
 	e.runningCh = make(chan interface{})
-	go e.run(currentBlock, hasBadBlock, e.runningCh)
+	go e.run(chain, e.runningCh)
 
 	return nil
 }
@@ -464,7 +617,7 @@ func (e *engine) FinalizeAndAssemble(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
 
-	e.logger.Info("RoRoRo FinalizeAndAssemble")
+	e.logger.Info("RoRoRo FinalizeAndAssemble", "#tx", len(txs))
 	// No block rewards in rororo, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = nilUncleHash
@@ -481,25 +634,36 @@ func (e *engine) FinalizeAndAssemble(
 // Note, the method returns immediately and will send the result async. More
 // than one result may also be returned depending on the consensus algorithm.
 func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
-	h := sealHash(block.Header())
-	e.logger.Info("RoRoRo Seal", "bn", block.Number(), "#s", hex.EncodeToString(h[:]))
+	hash := sealHash(block.Header())
+	e.logger.Info("RoRoRo Seal", "bn", block.Number(), "#s", hex.EncodeToString(hash[:]))
+
+	// Without this check we mine blocks constantly, which may be what we want
+	// ... yet with it we stall. not sure why yet
+	if false {
+		h := block.Header()
+		n := h.Number.Uint64()
+		ph := chain.GetHeader(h.ParentHash, n-1)
+		if ph == nil {
+			return consensus.ErrUnknownAncestor
+		}
+		if ph.Root == h.Root &&
+			ph.TxHash == h.TxHash &&
+			ph.ReceiptHash == h.ReceiptHash {
+			e.logger.Info(
+				"RoRoRo Seal skip identical block",
+				"#tx", len(block.Transactions()), "txhash", h.TxHash.Hex(),
+			)
+			results <- nil
+			return nil
+		}
+	}
+
 	// XXX: If we have a intent and the required confirmations for the block,
 	// sign it. In ethhash, this is where the PoW happens
 
 	e.runningCh <- &engSealTask{
 		RoundNumber: e.RoundNumber(),
 		Block:       block, Results: results, Stop: stop}
-
-	// roundChange := make(chan interface{})
-	// go e.NotifyRoundChange(roundChange, nil)
-	// go func() {
-	// 	select {
-	// 	case <-stop:
-	// 		return
-	// 	case <-roundChange:
-	// 		return
-	// 	}
-	// }()
 
 	return nil
 }
@@ -511,26 +675,47 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 // is < RoRoRoExtraVanity bytes long this function will panic (to avoid
 // accidentally creating the same hash for different blocks).
 func (e *engine) SealHash(header *types.Header) common.Hash {
-	e.logger.Info("RoRoRo SealHash")
-	return sealHash(header)
+	h := sealHash(header)
+	e.logger.Info("RoRoRo SealHash", "#", h.Hex())
+	return h
 }
 
 func sealHash(header *types.Header) common.Hash {
-	newHeader := types.CopyHeader(header)
-	newHeader.Extra = newHeader.Extra[:RoRoRoExtraVanity]
+
 	hasher := sha3.NewLegacyKeccak256()
-	hash := common.Hash{}
-	hasher.Sum(hash[:0])
-	return hash
+
+	h := common.Hash{}
+
+	rlp.Encode(hasher, []interface{}{
+		header.ParentHash,
+		header.UncleHash,
+		header.Coinbase,
+		header.Root,
+		header.TxHash,
+		header.ReceiptHash,
+		header.Bloom,
+		header.Difficulty,
+		header.Number,
+		header.GasLimit,
+		header.GasUsed,
+		header.Time,
+		header.Extra[:RoRoRoExtraVanity],
+	})
+	hasher.Sum(h[:0])
+	return h
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
 // that a new block should have. For rororo this is just the round number
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
 	e.logger.Info("RoRoRo CalcDifficulty")
-	// return e.RoundNumber() - no, this doesn't work unless we sync the rounds
-	// properly
-	return parent.Number.Add(parent.Number, bigOne)
+	e.intentMu.Lock()
+	defer e.intentMu.Unlock()
+
+	if e.candidates[e.nodeAddr] {
+		return difficultyForCandidate
+	}
+	return difficultyForEndorser
 }
 
 // APIs returns the RPC APIs this consensus engine provides.

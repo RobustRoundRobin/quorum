@@ -524,10 +524,34 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 		d.syncInitHook(origin, height)
 	}
 	fetchers := []func() error{
-		func() error { return d.fetchHeaders(p, origin+1, pivot) }, // Headers are always retrieved
-		func() error { return d.fetchBodies(origin + 1) },          // Bodies are retrieved during normal and fast sync
-		func() error { return d.fetchReceipts(origin + 1) },        // Receipts are retrieved during fast sync
-		func() error { return d.processHeaders(origin+1, pivot, td) },
+		func() error {
+			errerr := d.fetchHeaders(p, origin+1, pivot)
+			if errerr != nil {
+				log.Debug("fetchHeaders", "err", errerr)
+			}
+			return errerr
+		}, // Headers are always retrieved
+		func() error {
+			errerr := d.fetchBodies(origin + 1)
+			if errerr != nil {
+				log.Debug("fetchBodies", "err", errerr)
+			}
+			return errerr
+		}, // Bodies are retrieved during normal and fast sync
+		func() error {
+			errerr := d.fetchReceipts(origin + 1)
+			if errerr != nil {
+				log.Debug("fetchReceipts", "err", errerr)
+			}
+			return errerr
+		}, // Receipts are retrieved during fast sync
+		func() error {
+			errerr := d.processHeaders(origin+1, pivot, td)
+			if errerr != nil {
+				log.Debug("processHeaders", "err", errerr)
+			}
+			return errerr
+		},
 	}
 	if d.mode == FastSync {
 		fetchers = append(fetchers, func() error { return d.processFastSyncContent(latest) })

@@ -31,6 +31,7 @@ func (c *SignedEndorsement) VerifyNodeSig(nodeID Hash) (bool, error) {
 	return verifyNodeSig(nodeID, c.Sig[:], &c.Endorsement)
 }
 
+// DecodeSigned decodes the endorsment and returns the signers ecrecovered public key
 func (c *SignedEndorsement) DecodeSigned(s *rlp.Stream) ([]byte, error) {
 
 	sig, pub, body, err := decodeSigned(s)
@@ -39,7 +40,6 @@ func (c *SignedEndorsement) DecodeSigned(s *rlp.Stream) ([]byte, error) {
 	}
 	c.Sig = sig
 
-	// Do the defered decoding of the Endorsement now we have verified the sig
 	if err = rlp.DecodeBytes(body, &c.Endorsement); err != nil {
 		return nil, err
 	}

@@ -68,6 +68,7 @@ func readNodesJSON(path string) ([]*enode.Node, error) {
 
 		node, err := enode.Parse(enode.ValidSchemes, url)
 		if err != nil {
+			fmt.Println("go-ethereum (perplexingly) resolves dns names when parsing the url, try 127.0.0.1 then puting your dns name back in if that is the problem")
 			return nil, fmt.Errorf("node URL %s: %v", url, err)
 		}
 		nodes = append(nodes, node)

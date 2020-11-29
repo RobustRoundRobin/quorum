@@ -3,6 +3,7 @@ package rororo
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common/math"
@@ -38,6 +39,13 @@ func (h Hash) Address() Address {
 	a := Address{}
 	copy(a[:], h[12:])
 	return a
+}
+
+func (h Hash) Hex() string {
+	return hex.EncodeToString(h[:])
+}
+func (a Address) Hex() string {
+	return hex.EncodeToString(a[:])
 }
 
 // SignerPub recovers the public key that signed h
