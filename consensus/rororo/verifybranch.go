@@ -45,7 +45,10 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 		return err
 	}
 
-	// XXX: until we sort out the round synchronisation, this can't be enabled
+	// XXX: until we sort out the round synchronisation, this can't be enabled.
+	// Also, currently, we get asked to verify local mining work on endorsers,
+	// so the block number for the local (never to be commited) work will be
+	// equal to the block number from the leader
 	if parentSE.Intent.RoundNumber.Cmp(se.Intent.RoundNumber) >= 0 {
 		e.logger.Info("RoRoRo new block round number lower than current parent", "parent", parentSE.Intent.RoundNumber, "new", se.Intent.RoundNumber)
 		// return fmt.Errorf("rororo round number to young: %v > %v", parentSE.Intent.RoundNumber, se.Intent.RoundNumber)
@@ -64,7 +67,12 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	// Check that the intent in the seal matches the block described by the
 	// header
 	if se.Intent.ChainID != e.genesisEx.ChainID {
-		return se, fmt.Errorf("rororo sealed intent invalid chainid: %s", hex.EncodeToString(se.Intent.ChainID[:]))
+		// XXX: ARSE this is because the engine doesn't get the genesis until
+		// start is called, but verifyHeader is used by block
+		// synchronisation, and mining isn't started until sync is complete.
+		e.logger.Error("RoRoRo temprorily disabling Chain ID check. I have messed up the genesisEx.ChainID")
+		// return se, fmt.Errorf(
+		//	"rororo sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
 	}
 
 	// Ensure that the coinbase is valid
@@ -108,16 +116,16 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	for _, end := range se.Confirm {
 		// Check the endorsers ChainID
 		if end.ChainID != e.genesisEx.ChainID {
-			return se, fmt.Errorf("rororo endorsment chainid invalid: `%s'",
-				hex.EncodeToString(end.IntentHash[:]))
+			e.logger.Error("RoRoRo temprorily disabling Chain ID check. I have messed up the genesisEx.ChainID")
+			// return se, fmt.Errorf("rororo endorsment chainid invalid: `%s'",
+			// 	hex.EncodeToString(end.IntentHash[:]))
 		}
 
 		// Check that the intent hash signed by the endorser matches the intent
 		// sealed in the block header by the leader
 		if end.IntentHash != intentHash {
 			return se, fmt.Errorf("rororo endorsment intent hash mismatch: sealed=`%s' endorsed=`%s'",
-				hex.EncodeToString(intentHash[:]),
-				hex.EncodeToString(end.IntentHash[:]))
+				intentHash.Hex(), end.IntentHash.Hex())
 		}
 	}
 	return se, nil

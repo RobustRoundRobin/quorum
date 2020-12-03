@@ -43,23 +43,21 @@ type engSignedIntent struct {
 	SignedIntent
 	Pub        []byte // Derived from signature
 	ReceivedAt time.Time
+	Seq        uint // from RMsg
 }
 
 type engSignedEndorsement struct {
 	SignedEndorsement
 	Pub        []byte // Derived from signature
 	ReceivedAt time.Time
-}
-
-// engNewChainHead signals that the node has extended its chain.
-type engNewChainHead struct {
+	Seq        uint // from RMsg
 }
 
 type pendingIntent struct {
 	Candidate    bool
 	SI           *SignedIntent
 	SealHash     Hash
-	MsgHash      Hash
+	RMsg         RMsg
 	Msg          []byte
 	Endorsements []*SignedEndorsement
 	// Endorsers selected when the intent was issued. This map is not updated
@@ -84,7 +82,14 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 	e.runningWG.Add(1)
 
 	roundDuration := time.Duration(e.config.RoundLength) * time.Millisecond
-	roundTick := time.NewTimer(roundDuration)
+	roundTick := time.NewTicker(roundDuration)
+	// Idealy we want no ticks while we are an endorser, as endorsement is
+	// reactive, and regular ticks when we are a leader candidate. HOWEVER:
+	// time.Timer is *very* anoying.  In short: Stop is not idempotent. Stop is
+	// only safe after New or Reset. Stop followed by Stop will block forever.
+	// And Reset is only safe after Stop (or event). go 1.15 adds Reset to
+	// Ticker which would be ideal.  See
+	// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
 
 	// Endorsed leader candidates will broadcast the new block at the end of
 	// the round according to their tickers. We reset the ticker each time we
@@ -92,7 +97,6 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 	// align on the same time window for each round. In the absence of
 	// sufficient endorsments to produce a block, each leader candidate will
 	// simply re-broadcast their current intent.
-
 	roundState, roundNumber := e.nextRound(chain.CurrentBlock())
 	if roundState == RoundStateLeaderCandidate {
 		e.logger.Debug("RoRoRo leader candidate", "round", roundNumber)
@@ -102,7 +106,7 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 		select {
 		case newHead, ok := <-e.chainHeadCh:
 			if !ok {
-				e.logger.Info("RoRoRo engine.run chain head channel shutdown")
+				e.logger.Info("RoRoRo newHead - chain head channel shutdown")
 				return
 			}
 			e.logger.Info("RoRoRo ChainHeadEvent", "hash", newHead.Block.Hash().Hex())
@@ -119,36 +123,55 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 			// wether non leader nodes are active in a particular round or not.
 
 			roundState, roundNumber = e.nextRound(newHead.Block)
-			if roundState == RoundStateLeaderCandidate {
-				if !roundTick.Stop() {
-					<-roundTick.C
-				}
-				roundTick.Reset(roundDuration)
-				e.logger.Debug("RoRoRo leader candidate", "round", roundNumber)
+			if roundState != RoundStateLeaderCandidate {
+				continue
+			}
+
+			// The intent is cleared when the round changes. Now we now we are
+			// a leader candidate on the new round, establish our new intent.
+
+			e.logger.Debug("RoRoRo newHead - leader candidate", "round", roundNumber)
+
+			// If there is a current seal task, it will be resused, no matter
+			// how long it has been since the local node was a leader
+			// candidate.
+			if err := e.refreshSealTask(nil); err != nil {
+				e.logger.Info("RoRoRo newHead - refreshSealTask", "err", err)
+				continue
+			}
+
+			// Make our peers aware of our intent for this round, this may get
+			// reset by the arival of a new sealing task
+			if err := e.broadcastCurrentIntent(); err != nil {
+				e.logger.Info("RoRoRo newHead - broadcastCurrentIntent", "err", err)
 			}
 
 		case i, ok := <-ch:
+			e.logger.Info("RoRoRo run - handling event")
 			if !ok {
-				e.logger.Info("rororo engine.run input channel closed")
+				e.logger.Info("RoRoRo run - input channel closed")
 				return
 			}
 			switch et := i.(type) {
 
 			case *engSealTask:
+
 				// All nodes that are mining (started with --mine) will issue
 				// seal requests. RRR decides which of those are endorsers and
 				// which are leader candidates.
 				if roundState != RoundStateLeaderCandidate {
-					e.logger.Debug("RoRoRo non-leader ignoring engSealTask", "round", roundNumber)
+					e.logger.Debug("RoRoRo engSealTask - non-leader ignoring", "round", roundNumber)
 					continue
 				}
 
-				e.logger.Info("RoRoRo run got engSealTask", "round", roundNumber)
-				if err := e.handleSealTask(et); err != nil {
-					// There is no value I can see in posting nil back to the
-					// et.Results channel, it just gets ignored by the
-					// miner/worker resultLoop.
-					e.logger.Info("rororo run handleSealTask", "err", err)
+				e.logger.Info("RoRoRo engSealTask", "round", roundNumber)
+
+				if err := e.refreshSealTask(et); err != nil {
+					e.logger.Info("RoRoRo engSealTask - refreshSealTask", "err", err)
+					continue
+				}
+				if err := e.broadcastCurrentIntent(); err != nil {
+					e.logger.Info("RoRoRo engSealTask - broadcastCurrentIntent", "err", err)
 				}
 				// intent -> leader candidates
 
@@ -197,10 +220,12 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 		case <-roundTick.C:
 			var confirmed bool
 			var err error
+
 			if roundState != RoundStateLeaderCandidate {
+				e.logger.Debug("RoRoRo run is awake - endorsing")
 				continue
 			}
-			roundTick.Reset(roundDuration)
+			e.logger.Debug("RoRoRo run is awake - leader candidate")
 
 			if confirmed, err = e.sealCurrentBlock(); err != nil {
 				e.logger.Info("RoRoRo sealCurrentBlock", "err", err)
@@ -219,14 +244,6 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 			}
 		}
 	}
-}
-
-func (e *engine) handleSealTask(et *engSealTask) error {
-
-	if err := e.refreshSealTask(et); err != nil {
-		return err
-	}
-	return e.broadcastCurrentIntent()
 }
 
 func (e *engine) handleIntent(et *engSignedIntent) error {
@@ -267,7 +284,10 @@ func (e *engine) handleIntent(et *engSignedIntent) error {
 	}
 	c.IntentHash, err = et.SignedIntent.Hash()
 
-	rmsg := &RMsg{Code: RMsgConfirm}
+	// Note: by including the senders sequence, and remembering that the sender
+	// will be changing the round also, we can be sure we will reply even if
+	// the intent is otherwise a duplicate.
+	rmsg := &RMsg{Code: RMsgConfirm, Seq: et.Seq}
 	rmsg.Raw, err = c.SignedEncode(e.privateKey)
 	if err != nil {
 		e.logger.Info("RoRoRo encoding SignedEndorsement", "err", err.Error())
@@ -284,7 +304,7 @@ func (e *engine) handleIntent(et *engSignedIntent) error {
 		"endorser", e.nodeID.Hex())
 
 	// find the peer candidate
-	return e.Send(common.Address(intenderAddr), msg, e.RoundNumber())
+	return e.Send(common.Address(intenderAddr), msg)
 }
 
 func (e *engine) handleEndorsement(et *engSignedEndorsement) error {
@@ -413,6 +433,7 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 
 	e.sealTask.Results <- e.sealTask.Block.WithSeal(header)
 	e.sealTask = nil
+	e.intent = nil
 
 	// XXX: TODO decide if legitimate leader candidate and if in correct phase
 
@@ -444,11 +465,6 @@ func (e *engine) nextRound(head *types.Block) (RoundState, *big.Int) {
 		e.logger.Info("RoRoRo endorser committee")
 		return RoundStateEndorserCommittee, roundNumber
 	}
-
-	if e.sealTask != nil && !e.sealTask.Canceled() {
-		e.sealTask.Results <- nil
-	}
-	e.sealTask = nil
 	e.intent = nil
 
 	return RoundStateLeaderCandidate, roundNumber
@@ -461,34 +477,32 @@ func (e *engine) refreshSealTask(et *engSealTask) error {
 
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
+
 	// these are just for telemetry
-	hseal, hmsg := "nil", "nil"
+	hseal, hmsg := "nil", e.intentMsgHash.Hex()
 	if e.intent != nil {
 		hseal = e.intent.SealHash.Hex()
-		hmsg = e.intent.MsgHash.Hex()
 	}
 
 	// Reconcile whether to re-issue current seal task
 	if et == nil {
 		if e.sealTask == nil {
-			e.logger.Info("RoRoRo reissueSealTask", "hseal", "none")
+			e.logger.Info("RoRoRo refreshSealTask", "hseal", "none")
 			return nil
 		}
 		et = e.sealTask
-		// note it is a bug in this function if intent is nil at this point
-		e.logger.Info("RoRoRo reissueSealTask", "hseal", hseal, "hmsg", hmsg)
+		e.logger.Info("RoRoRo refreshSealTask", "hseal", hseal, "hmsg", hmsg)
 	}
 
 	if et.Canceled() {
-		e.logger.Info("RoRoRo handleSealTask cancelled", "hseal", hseal, "hmsg", hmsg)
+		e.logger.Info("RoRoRo refreshSealTask - cancelled", "hseal", hseal, "hmsg", hmsg)
 		return nil
 	}
 
-	// Drop the current intent if there is one and its different. It is not
-	// clear yet whether we need this accommodation for re-issuing duplicate
-	// intents
-
-	newIntent, err := e.newPendingIntent(et)
+	// The sequence ensures we re-broadcast the intent even if the seal task
+	// hasn't changed.
+	e.intentSeq += 1
+	newIntent, err := e.newPendingIntent(et, e.intentSeq)
 	if err != nil {
 		return err
 	}
@@ -496,32 +510,40 @@ func (e *engine) refreshSealTask(et *engSealTask) error {
 	// There is no need to send nil to Results on the previous task, the geth
 	// miner worker can't do anything with that information
 	e.sealTask = et
+	newIntentHash := Keccak256Hash(newIntent.Msg)
 
-	if e.intent != nil {
+	// The intent may be nil, but we always remember the most recent intent msg hash
+	if e.intentMsgHash == newIntentHash {
 
-		if e.intent.MsgHash == newIntent.MsgHash {
-			e.logger.Info("RoRoRo reissueSealTask no change", "hseal", hseal, "hmsg", hmsg)
-			return nil
+		// If we are re-issuing *and* we have endorsments, copy them forward.
+		// Note the intent hash will not match if the round has changed.
+		if e.intent != nil {
+
+			newIntent.Endorsements = append(newIntent.Endorsements, e.intent.Endorsements...)
+
+			if len(e.intent.Endorsements) > 0 {
+				e.logger.Debug("RoRoRo refreshSealTask - re-issue preserving endorsements")
+			}
+			for _, end := range newIntent.Endorsements {
+				newIntent.Endorsers[common.Address(end.EndorserID.Address())] = true
+			}
 		}
-		e.logger.Info("RoRoRo droping pending intent",
-			"ends", len(e.intent.Endorsers), "cons", len(e.intent.Endorsements),
-			"hseal", hseal,
-			"hmsg", hex.EncodeToString(e.intent.MsgHash[:]),
-		)
+		e.logger.Info("RoRoRo refreshSealTask - no change", "hseal", hseal, "hmsg", hmsg)
+	} else {
+		e.logger.Info("RoRoRo refreshSealTask - new intent")
 	}
-
 	e.intent = newIntent
+	e.intentMsgHash = newIntentHash
 
-	e.logger.Info("RoRoRo new pending intent",
-		"ends", len(e.intent.Endorsers), "cons", len(e.intent.Endorsements),
-		"hseal", hex.EncodeToString(e.intent.SealHash[:]),
-		"hmsg", hex.EncodeToString(e.intent.MsgHash[:]),
+	e.logger.Info("RoRoRo refreshSealTask - current intent",
+		"ends", len(newIntent.Endorsers), "cons", len(newIntent.Endorsements),
+		"hseal", newIntent.SealHash.Hex(), "hmsg", e.intentMsgHash.Hex(),
 	)
 
 	return nil
 }
 
-func (e *engine) newPendingIntent(et *engSealTask) (*pendingIntent, error) {
+func (e *engine) newPendingIntent(et *engSealTask, seq uint) (*pendingIntent, error) {
 
 	var err error
 
@@ -530,7 +552,9 @@ func (e *engine) newPendingIntent(et *engSealTask) (*pendingIntent, error) {
 		"tx#", et.Block.TxHash().Hex(),
 		"parent#", et.Block.ParentHash().Hex(),
 	)
-	pe := &pendingIntent{}
+	pe := &pendingIntent{
+		RMsg: RMsg{Code: RMsgIntent, Seq: seq},
+	}
 
 	pe.SealHash = Hash(sealHash(et.Block.Header()))
 
@@ -545,25 +569,18 @@ func (e *engine) newPendingIntent(et *engSealTask) (*pendingIntent, error) {
 			TxHash:      Hash(et.Block.TxHash()), // the hash is computed by NewBlock
 		},
 	}
-	// XXX: If the hash of the whole message is the same as the previously
-	// broadcast, it will not get re-broadcast. I intent to put a sequence on
-	// the RMsg to let us override that here
-	rmsg := &RMsg{Code: RMsgIntent}
-	rmsg.Raw, err = pe.SI.SignedEncode(e.privateKey)
+	pe.RMsg.Raw, err = pe.SI.SignedEncode(e.privateKey)
 	if err != nil {
 		return nil, err
 	}
 
-	if pe.Msg, err = rlp.EncodeToBytes(rmsg); err != nil {
+	if pe.Msg, err = rlp.EncodeToBytes(pe.RMsg); err != nil {
 		e.logger.Info("RoRoRo encoding RMsgIntent", "err", err.Error())
 		return nil, err
 	}
-	pe.MsgHash = Keccak256Hash(pe.Msg)
 
 	pe.Endorsements = make([]*SignedEndorsement, 0, e.config.EndorsersQuorum)
 	pe.Endorsers = make(map[common.Address]bool)
-
-	// pe.EndorserPeers = make(map[common.Address]consensus.Peer)
 
 	return pe, nil
 }
@@ -605,14 +622,10 @@ func (e *engine) broadcastCurrentIntent() error {
 	e.intentMu.Lock()
 	if e.intent == nil {
 		e.intentMu.Unlock()
+		e.logger.Debug("RoRoRo broadcastCurrentIntent - no intent")
 		return nil
 	}
 
-	// XXX: Note if the message bytes are the same as the last broadcast, it
-	// will not be sent unless the sending of the previous attempt failed. This
-	// may be a feature or a curse - not sure yet. If we want the messages to
-	// definitely get re-broadcast we can put a counter in the outer message
-	// struct.
 	msg := e.intent.Msg
 	endorsers := e.broadcaster.FindPeers(e.endorsers)
 	e.logger.Info("RoRoRo BroadcastCurrentIntent", "endorsers", len(e.endorsers), "online", len(endorsers))
@@ -621,5 +634,5 @@ func (e *engine) broadcastCurrentIntent() error {
 	if len(endorsers) == 0 {
 		return nil
 	}
-	return e.Broadcast(e.nodeAddr, endorsers, msg, e.RoundNumber())
+	return e.Broadcast(e.nodeAddr, endorsers, msg)
 }

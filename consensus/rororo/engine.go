@@ -79,7 +79,10 @@ const (
 
 type RMsg struct {
 	Code RMsgCode
-	Raw  rlp.RawValue
+	// Seq should be incremented to cause an explicit message resend. It is not
+	// used for any other purpose
+	Seq uint
+	Raw rlp.RawValue
 }
 
 // API is a user facing RPC API to dump Istanbul state
@@ -149,9 +152,11 @@ type engine struct {
 	roundNumberMu sync.RWMutex // is held by roundNumberC
 	roundNumber   *big.Int
 
-	intentMu sync.Mutex
-	sealTask *engSealTask
-	intent   *pendingIntent
+	intentMu      sync.Mutex
+	sealTask      *engSealTask
+	intentSeq     uint // ensures we re-issue the intent even if the round doesn't change
+	intentMsgHash Hash // we remember the most recent intent hash, even if the intent is cleared, to help with telemetry
+	intent        *pendingIntent
 	// These get updated each round on all nodes without regard to which are
 	// leaders/endorsers or participants.
 	candidates map[common.Address]bool
@@ -219,35 +224,41 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 	if err = data.Decode(&msg); err != nil {
 		return true, err
 	}
+	msgHash := Keccak256Hash(msg)
+
 	rmsg := &RMsg{}
 	if err = rlp.DecodeBytes(msg, rmsg); err != nil {
 		return true, err
 	}
 
-	hash := Keccak256Hash(rmsg.Raw)
-	e.logger.Debug("RoRoRo messaging handling msg", "hash", hex.EncodeToString(hash[:]))
+	e.logger.Debug("RoRoRo HandleMsg", "#msg", msgHash.Hex(), "#raw", Keccak256Hash(rmsg.Raw).Hex())
 
-	if seen := e.updateInboundMsgTracking(peerAddr, hash); seen {
+	// Note: it is the msgHash we want here, not the raw hash. We want it to be
+	// possible for leader candidates to request a re-evaluation of the same
+	// block proposal. Otherwise they can get stuck in small network scenarios.
+	if seen := e.updateInboundMsgTracking(peerAddr, msgHash); seen {
+		e.logger.Debug("RoRoRo HandleMsg - ignoring previously seen")
 		return true, nil
 	}
 
 	switch rmsg.Code {
 	case RMsgIntent:
 
-		si := &engSignedIntent{ReceivedAt: data.ReceivedAt}
+		si := &engSignedIntent{ReceivedAt: data.ReceivedAt, Seq: rmsg.Seq}
 
 		if si.Pub, err = si.DecodeSigned(NewBytesStream([]byte(rmsg.Raw))); err != nil {
 			e.logger.Info("RoRoRo Intent decodeverify failed", "err", err)
 			return true, err
 		}
 
+		e.logger.Debug("RoRoRo HandleMsg - post engSignedIntent")
 		e.runningCh <- si
 
 		return true, nil
 
 	case RMsgConfirm:
 
-		sc := &engSignedEndorsement{ReceivedAt: data.ReceivedAt}
+		sc := &engSignedEndorsement{ReceivedAt: data.ReceivedAt, Seq: rmsg.Seq}
 
 		r := bytes.NewReader([]byte(rmsg.Raw))
 		s := rlp.NewStream(r, uint64(len(rmsg.Raw)))
@@ -257,6 +268,7 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 			return true, err
 		}
 
+		e.logger.Debug("RoRoRo HandleMsg - post engSignedEndorsement")
 		e.runningCh <- sc
 
 		return true, nil
@@ -266,30 +278,27 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 	}
 }
 
-// Send the message to the peer. If roundHorizon is true the message will be
-// re-sent if it has not already been sent on or after this round. Otherwise it
-// will only be sent if the message hash isn't in the ARU cache at all.
-// Typically the horizon should be the current round or nil. Note: the round is
-// a parameter to avoid taking the roundNumberMu in a potentially surprising
-// context.
-func (e *engine) Send(peerAddr common.Address, msg []byte, roundHorizon *big.Int) error {
+// Send the message to the peer - if its hash is not in the ARU cache for the
+// peer
+func (e *engine) Send(peerAddr common.Address, msg []byte) error {
+	e.logger.Debug("RoRoRo Send")
 
 	msgHash := Keccak256Hash(msg)
 
 	peers := e.broadcaster.FindPeers(map[common.Address]bool{peerAddr: true})
 	if len(peers) != 1 {
-		return fmt.Errorf("RoRoRo no peer connection for received Intent")
+		return fmt.Errorf("RoRoRo Send - no peer connection")
 	}
 	peer := peers[peerAddr]
 	if peer == nil {
 		return fmt.Errorf("internal error, FindPeers returning unasked for peer")
 	}
-	return e.peerSend(peer, peerAddr, msg, msgHash, roundHorizon)
+	return e.peerSend(peer, peerAddr, msg, msgHash)
 }
 
-// Broadcast the message to the provided peers, skipping self. roundHorizon is
-// same as for Send
-func (e *engine) Broadcast(self common.Address, peers map[common.Address]consensus.Peer, msg []byte, roundHorizon *big.Int) error {
+// Broadcast the message to the provided peers, skipping self. If we have
+// previously sent the message to a peer, it is not resent.
+func (e *engine) Broadcast(self common.Address, peers map[common.Address]consensus.Peer, msg []byte) error {
 
 	msgHash := Keccak256Hash(msg)
 	// e.logger.Debug("RoRoRo messaging broadcasting msg", "hash", hex.EncodeToString(msgHash[:]))
@@ -297,12 +306,12 @@ func (e *engine) Broadcast(self common.Address, peers map[common.Address]consens
 	for peerAddr, peer := range peers {
 
 		if peerAddr == self {
-			e.logger.Info("skipping self")
+			e.logger.Debug("RoRoRo Broadcast - skipping self")
 			continue
 		}
 
-		if err := e.peerSend(peer, peerAddr, msg, msgHash, roundHorizon); err != nil {
-			e.logger.Info("RoRoRo error sending msg", "err", err, "peer", peerAddr)
+		if err := e.peerSend(peer, peerAddr, msg, msgHash); err != nil {
+			e.logger.Info("RoRoRo Broadcast - error sending msg", "err", err, "peer", peerAddr)
 		}
 	}
 	return nil
@@ -310,7 +319,6 @@ func (e *engine) Broadcast(self common.Address, peers map[common.Address]consens
 
 func (e *engine) peerSend(
 	peer consensus.Peer, peerAddr common.Address, msg []byte, msgHash Hash,
-	roundHorizon *big.Int,
 ) error {
 
 	e.messagingMu.Lock()
@@ -320,28 +328,7 @@ func (e *engine) peerSend(
 
 	if i, ok := e.peerMessages.Get(peerAddr); ok {
 		msgs = i.(*lru.ARCCache) // panic if we have put the wrong type in the cache
-		if ir, ok := msgs.Get(msgHash); ok {
-			if sentRound, ok := ir.(*big.Int); ok {
-				if sentRound.Cmp(roundHorizon) < 0 {
-					// sent < horizon means its forgotten.
-					return nil
-				}
-				// re-send, because its at or within the horizon
-				e.logger.Debug("RoRoRo re-send for peer", "peer", peerAddr.Hex(), "#msg", msgHash.Hex())
-			} else {
-				if roundHorizon == nil {
-					// The message has been seen before and we are not
-					// forgetting messages sent in earlier rounds. So we don't
-					// care that there is no record of the round that the
-					// message was sent on
-					return nil
-				}
-				// sentRound is the zero of ptr T, which is nil
-				// We don't know when it was sent. We act on what the caller
-				// *now*. Which is to be sure the message is sent this round.
-				// And then we ill set the sentRound for the next time.
-				e.logger.Debug("RoRoRo re-send for peer (prior msg round unknown)", "peer", peerAddr.Hex(), "#msg", msgHash.Hex())
-			}
+		if _, ok := msgs.Get(msgHash); ok {
 			// have already sent the message to, or received it from, this peer
 			return nil
 		}
@@ -349,20 +336,10 @@ func (e *engine) peerSend(
 		msgs, _ = lru.NewARC(lruMessages)
 	}
 
-	// All of RRR consensus messages are sent with the horizon enabled. For
-	// other message kinds (none as yet) we can only apply the round horizon to
-	// messages that were most recently sent with the horzon enabled. If we send
-	// a message without the horizon then it will not be resent until the ARU
-	// cache limit is reached or until it is sent a again *with* the horizon.
-	// This strategy may theoretically cause redunant resends. In practice we
-	// don't expect this pattern of message sending. And we are not sensitive to
-	// duplicates for any RRR consensus messsages - everything is idempotent.
-	if roundHorizon == nil {
-		msgs.Add(msgHash, true)
-	} else {
-		msgs.Add(msgHash, roundHorizon)
-	}
+	msgs.Add(msgHash, true)
 	e.peerMessages.Add(peerAddr, msgs)
+
+	e.logger.Debug("RoRoRo peerSend - sending", "hash", msgHash.Hex(), "safe-hash", Keccak256Hash(msg).Hex())
 
 	// Send will error imediately on encoding problems. But otherwise it
 	// will block until the receiver consumes the message or the send times
@@ -373,8 +350,6 @@ func (e *engine) peerSend(
 
 // updateInboundMsgTracking updates the tracking of messages inbound from peers
 func (e *engine) updateInboundMsgTracking(peerAddr common.Address, hash Hash) bool {
-
-	round := e.RoundNumber()
 
 	// keep track of messages seen from this peer recently
 	e.messagingMu.Lock()
@@ -395,7 +370,6 @@ func (e *engine) updateInboundMsgTracking(peerAddr common.Address, hash Hash) bo
 		e.selfMessages.Add(hash, true)
 	}
 	return seen
-
 }
 
 // SetBroadcaster implements consensus.Handler.SetBroadcaster
@@ -525,6 +499,7 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 // via the VerifySeal method.
 func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header, seal bool) error {
 	e.logger.Info("RoRoRo VerifyHeader")
+
 	return e.verifyBranchHeaders(chain, header, nil)
 }
 
@@ -534,6 +509,7 @@ func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header,
 // the input slice).
 func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
 	e.logger.Info("RoRoRo VerifyHeaders")
+
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
 	go func() {
@@ -564,6 +540,7 @@ func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Hea
 // rules of a given engine.
 func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) error {
 	e.logger.Info("RoRoRo VerifyUncles")
+
 	if len(block.Uncles()) > 0 {
 		return errInvalidUncleHash
 	}
@@ -574,6 +551,7 @@ func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 // the consensus rules of the given engine.
 func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
 	e.logger.Info("RoRoRo VerifySeal")
+
 	if _, err := e.verifyHeader(chain, header); err != nil {
 		return err
 	}
@@ -603,6 +581,7 @@ func (e *engine) Finalize(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header) {
 	e.logger.Info("RoRoRo Finalize")
+
 	// No block rewards in rororo, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = nilUncleHash
@@ -618,6 +597,7 @@ func (e *engine) FinalizeAndAssemble(
 	uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
 
 	e.logger.Info("RoRoRo FinalizeAndAssemble", "#tx", len(txs))
+
 	// No block rewards in rororo, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = nilUncleHash
@@ -677,6 +657,7 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 func (e *engine) SealHash(header *types.Header) common.Hash {
 	h := sealHash(header)
 	e.logger.Info("RoRoRo SealHash", "#", h.Hex())
+
 	return h
 }
 
@@ -709,6 +690,7 @@ func sealHash(header *types.Header) common.Hash {
 // that a new block should have. For rororo this is just the round number
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
 	e.logger.Info("RoRoRo CalcDifficulty")
+
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
 
@@ -737,5 +719,5 @@ func (e *engine) Protocol() consensus.Protocol {
 // Close terminates any background threads maintained by the consensus engine.
 func (e *engine) Close() error {
 	e.logger.Info("RoRoRo Close")
-	return ErrNotImplemented
+	return nil
 }
