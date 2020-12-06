@@ -2,11 +2,17 @@ package rororo
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
+)
+
+var (
+	errDecodingGenesisExtra = errors.New("failed to decode extra field from genesis block")
 )
 
 // This will become 'Algorithm 5 VerifyBranch' and related machinery, but its
@@ -19,15 +25,31 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 
 	var err error
 	var se *SignedExtraData
-	if se, err = e.verifyHeader(chain, header); err != nil {
-		return err
+
+	number := header.Number.Uint64()
+
+	// The genesis block is the always valid dead-end. However, geth calls
+	// VerifyBranchHeaders as it warms up before looking at any other blocks.
+	// This is the only opportunity to collect the genesis extra data on nodes
+	// that have to sync before they can participate.
+
+	if number == 0 {
+
+		h0 := Hash{}
+		if e.genesisEx.ChainID == h0 {
+			e.logger.Info("RoRoRo VerifyBranchHeaders - genesis block", "extra", hex.EncodeToString(header.Extra))
+			err := rlp.DecodeBytes(header.Extra, &e.genesisEx)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 
 	// XXX: TODO just verify one deep for now
-	number := header.Number.Uint64()
-	// The genesis block is the always valid dead-end
-	if number == 0 {
-		return nil
+	if se, err = e.verifyHeader(chain, header); err != nil {
+		return err
 	}
 
 	var parent *types.Header
@@ -59,6 +81,10 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 
 func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header) (*SignedExtraData, error) {
 
+	if header.Number.Cmp(big0) == 0 {
+		return nil, fmt.Errorf("RoRoRo the genesis header cannot be verified by this method")
+	}
+
 	// Check the seal (extraData) format is correct and signed
 	se, sealerID, _ /*sealerPub*/, err := e.decodeHeaderSeal(header)
 	if err != nil {
@@ -67,12 +93,8 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	// Check that the intent in the seal matches the block described by the
 	// header
 	if se.Intent.ChainID != e.genesisEx.ChainID {
-		// XXX: ARSE this is because the engine doesn't get the genesis until
-		// start is called, but verifyHeader is used by block
-		// synchronisation, and mining isn't started until sync is complete.
-		e.logger.Error("RoRoRo temprorily disabling Chain ID check. I have messed up the genesisEx.ChainID")
-		// return se, fmt.Errorf(
-		//	"rororo sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
+		return se, fmt.Errorf(
+			"rororo sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
 	}
 
 	// Ensure that the coinbase is valid
@@ -87,7 +109,7 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	// Check that the NodeID in the intent matches the sealer
 	if sealerID != se.Intent.NodeID {
 		return se, fmt.Errorf("rororo sealer node id mismatch: sealer=`%s' node=`%s'",
-			hex.EncodeToString(sealerID[:]), hex.EncodeToString(se.Intent.NodeID[:]))
+			sealerID.Hex(), se.Intent.NodeID.Hex())
 	}
 
 	// Check that the sealed parent hash from the intent matches the parent
@@ -116,9 +138,7 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	for _, end := range se.Confirm {
 		// Check the endorsers ChainID
 		if end.ChainID != e.genesisEx.ChainID {
-			e.logger.Error("RoRoRo temprorily disabling Chain ID check. I have messed up the genesisEx.ChainID")
-			// return se, fmt.Errorf("rororo endorsment chainid invalid: `%s'",
-			// 	hex.EncodeToString(end.IntentHash[:]))
+			return se, fmt.Errorf("rororo endorsment chainid invalid: `%s'", end.IntentHash.Hex())
 		}
 
 		// Check that the intent hash signed by the endorser matches the intent
@@ -131,11 +151,56 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	return se, nil
 }
 
+func (e *engine) decodeActivity(header *types.Header) ([]Endorsement, []Enrolment, Hash, []byte, error) {
+
+	// Common and fast path first
+	if header.Number.Cmp(big0) > 0 {
+		se, sealerID, pub, err := e.decodeHeaderSeal(header)
+		if err != nil {
+			return nil, nil, Hash{}, nil, err
+		}
+		return se.ExtraData.Confirm, se.ExtraData.Enrol, sealerID, pub, nil
+	}
+
+	// Genesis block needs special handling, don't short circuit to e.genesisEx
+	// incase we are called in surprising contexts.
+
+	ge := &GenesisExtraData{}
+	err := rlp.DecodeBytes(header.Extra, ge)
+	if err != nil {
+		return nil, nil, Hash{}, nil, fmt.Errorf("%v: %w", err, errDecodingGenesisExtra)
+	}
+
+	// But do require consistency, if it has been previously decoded
+	h0 := Hash{}
+	if e.genesisEx.ChainID != h0 && e.genesisEx.ChainID != ge.ChainID {
+		return nil, nil, Hash{}, nil, fmt.Errorf(
+			"genesis header with incorrect chainID: %w", errDecodingGenesisExtra)
+	}
+
+	// Get the genesis signer public key and node id. Do this derivation of
+	// node id and public key unconditionally regardless of wheter we think we
+	// have the information to hand - it is just safer that way.
+	genPub, err := Ecrecover(ge.IdentInit[0].U[:], ge.IdentInit[0].Q[:])
+	if err != nil {
+		return nil, nil, Hash{}, nil, fmt.Errorf("%v:%w", err, errGensisIdentitiesInvalid)
+	}
+
+	genID := Hash{}
+	copy(genID[:], Keccak256(genPub[1:65]))
+
+	return []Endorsement{}, ge.IdentInit, genID, genPub, nil
+}
+
 func (e *engine) decodeHeaderSeal(header *types.Header) (*SignedExtraData, Hash, []byte, error) {
 
 	var err error
 	var pub []byte
 	var sealerID Hash
+
+	if header.Number.Cmp(big0) == 0 {
+		return nil, Hash{}, nil, fmt.Errorf("the genesis block is not compatible with decodeHeaderSeal")
+	}
 
 	if len(header.Extra) < RoRoRoExtraVanity {
 		return nil, Hash{}, nil, fmt.Errorf("RoRoRo missing extra data on block header")

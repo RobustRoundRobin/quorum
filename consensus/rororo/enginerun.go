@@ -3,14 +3,22 @@ package rororo
 // engine methods for activities descendent to the run() method
 
 import (
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
+)
+
+var (
+	errSealSeedFailed = errors.New("failed to generate a seed for the next block")
 )
 
 // eng* types can be sent at any tome the the engines main channel.
@@ -63,7 +71,6 @@ type pendingIntent struct {
 	// Endorsers selected when the intent was issued. This map is not updated
 	// after it is first created
 	Endorsers map[common.Address]bool
-	// EndorserPeers map[common.Address]consensus.Peer
 }
 
 type RoundState int
@@ -82,14 +89,8 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 	e.runningWG.Add(1)
 
 	roundDuration := time.Duration(e.config.RoundLength) * time.Millisecond
-	roundTick := time.NewTicker(roundDuration)
-	// Idealy we want no ticks while we are an endorser, as endorsement is
-	// reactive, and regular ticks when we are a leader candidate. HOWEVER:
-	// time.Timer is *very* anoying.  In short: Stop is not idempotent. Stop is
-	// only safe after New or Reset. Stop followed by Stop will block forever.
-	// And Reset is only safe after Stop (or event). go 1.15 adds Reset to
-	// Ticker which would be ideal.  See
-	// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
+	roundTick := time.NewTimer(roundDuration)
+	numRoundTicks := 0 // the count of ticks that have elapsed since last block, this should ideal stay at 0 or 1.
 
 	// Endorsed leader candidates will broadcast the new block at the end of
 	// the round according to their tickers. We reset the ticker each time we
@@ -97,7 +98,7 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 	// align on the same time window for each round. In the absence of
 	// sufficient endorsments to produce a block, each leader candidate will
 	// simply re-broadcast their current intent.
-	roundState, roundNumber := e.nextRound(chain.CurrentBlock())
+	roundState, roundNumber := e.nextRound(chain, nil)
 	if roundState == RoundStateLeaderCandidate {
 		e.logger.Debug("RoRoRo leader candidate", "round", roundNumber)
 	}
@@ -109,27 +110,35 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 				e.logger.Info("RoRoRo newHead - chain head channel shutdown")
 				return
 			}
-			e.logger.Info("RoRoRo ChainHeadEvent", "hash", newHead.Block.Hash().Hex())
-
+			e.logger.Debug("RoRoRo ChainHeadEvent", "hash", newHead.Block.Hash().Hex())
+			numRoundTicks = 0
 			// To get here, VerifyHeader and VerifySeal must have seen and
 			// accepted the block. We can only get a 'bad' block here if the
 			// consensus interface is not being honoured.
 
-			// RRR's notion of active and age requires that honest nodes give
-			// endorsers a consistent amount of time per round to record their
-			// endorsment by signing an intent for the leader. Whether or not
-			// the endorsement was required to reach the quorum, the presence
-			// of the endorsement in the block header is how RRR determines
-			// wether non leader nodes are active in a particular round or not.
+			// Reset the timer when a new block arrives. This should offer lose
+			// synchronisation.  RRR's notion of active and age requires that
+			// honest nodes give endorsers a consistent amount of time per
+			// round to record their endorsment by signing an intent for the
+			// leader. Whether or not the endorsement was required to reach the
+			// quorum, the presence of the endorsement in the block header is
+			// how RRR determines if non leader nodes are active in a
+			// particular round.  Chosing not to incorporate the block time
+			// stamp as yet. Note that go timers are quite tricky, see
+			// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
+			if !roundTick.Stop() { // Stop and drain
+				<-roundTick.C
+			}
+			roundTick.Reset(roundDuration)
 
-			roundState, roundNumber = e.nextRound(newHead.Block)
+			roundState, roundNumber = e.nextRound(chain, newHead.Block)
 			if roundState != RoundStateLeaderCandidate {
 				continue
 			}
 
-			// The intent is cleared when the round changes. Now we now we are
-			// a leader candidate on the new round, establish our new intent.
-
+			// The intent is cleared when the round changes. Here we know we
+			// are a leader candidate on the new round, establish our new
+			// intent.
 			e.logger.Debug("RoRoRo newHead - leader candidate", "round", roundNumber)
 
 			// If there is a current seal task, it will be resused, no matter
@@ -147,7 +156,7 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 			}
 
 		case i, ok := <-ch:
-			e.logger.Info("RoRoRo run - handling event")
+			e.logger.Trace("RoRoRo run - handling event")
 			if !ok {
 				e.logger.Info("RoRoRo run - input channel closed")
 				return
@@ -160,7 +169,7 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 				// seal requests. RRR decides which of those are endorsers and
 				// which are leader candidates.
 				if roundState != RoundStateLeaderCandidate {
-					e.logger.Debug("RoRoRo engSealTask - non-leader ignoring", "round", roundNumber)
+					e.logger.Trace("RoRoRo engSealTask - non-leader ignoring", "round", roundNumber)
 					continue
 				}
 
@@ -182,7 +191,7 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 				if roundState != RoundStateEndorserCommittee {
 					// This is un-expected. Likely late, or possibly from
 					// broken node
-					e.logger.Debug("RoRoRo non-endorser ignoring engSignedIntent", "round", roundNumber)
+					e.logger.Trace("RoRoRo non-endorser ignoring engSignedIntent", "round", roundNumber)
 					continue
 				}
 
@@ -201,14 +210,13 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 				if roundState != RoundStateLeaderCandidate {
 					// This is un-expected. Likely late, or possibly from
 					// broken node
-					e.logger.Debug("RoRoRo non-leader ignoring engSignedEndorsement", "round", roundNumber)
+					e.logger.Trace("RoRoRo non-leader ignoring engSignedEndorsement", "round", roundNumber)
 					continue
 				}
 
-				e.logger.Info("RoRoRo run got engSignedEndorsement",
+				e.logger.Trace("RoRoRo run got engSignedEndorsement",
 					"round", e.RoundNumber(),
-					"endorser", hex.EncodeToString(et.EndorserID[:]),
-					"intent", hex.EncodeToString(et.IntentHash[:]))
+					"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
 				if err := e.handleEndorsement(et); err != nil {
 					e.logger.Info("rororo run handleIntent", "err", err)
 				}
@@ -221,11 +229,16 @@ func (e *engine) run(chain RoRoRoChainReader, ch <-chan interface{}) {
 			var confirmed bool
 			var err error
 
+			// We MUST reset, else the Stop when a new block arrives will block
+			roundTick.Reset(roundDuration)
+
+			numRoundTicks += 1
+
 			if roundState != RoundStateLeaderCandidate {
-				e.logger.Debug("RoRoRo run is awake - endorsing")
+				e.logger.Debug("RoRoRo round tick - endorsing", "ticks", numRoundTicks)
 				continue
 			}
-			e.logger.Debug("RoRoRo run is awake - leader candidate")
+			e.logger.Debug("RoRoRo round tick - leader candidate", "ticks", numRoundTicks)
 
 			if confirmed, err = e.sealCurrentBlock(); err != nil {
 				e.logger.Info("RoRoRo sealCurrentBlock", "err", err)
@@ -412,14 +425,27 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 	// double up on checks here.
 	header := e.sealTask.Block.Header()
 
+	// role a new seed for the next round, this is all a bit 'make believe' in
+	// the absence of VRF's
+	seed := make([]byte, 8)
+	nrand, err := cryptorand.Read(seed)
+	if err != nil {
+		return false, fmt.Errorf("crypto/rand.Read failed - %v: %w", err, errSealSeedFailed)
+	}
+	if nrand != 8 {
+		return false, fmt.Errorf("crypto/rand.Read insufficient entropy - %v: %w", err, errSealSeedFailed)
+	}
+	if err != nil || nrand != 8 {
+		return false, fmt.Errorf("failed reading random seed")
+	}
+
 	data := &SignedExtraData{
 		ExtraData: ExtraData{
 			Intent:  e.intent.SI.Intent,
 			Confirm: make([]Endorsement, len(e.intent.Endorsements)),
+			Seed:    seed,
 		},
-		// XXX: TODO enrolments,
-		// XXX: TODO seed
-		// XXX: TODO seed proof
+		// XXX: TODO seed proof / VRF's
 	}
 	for i, c := range e.intent.Endorsements {
 		data.Confirm[i] = c.Endorsement
@@ -440,9 +466,13 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 	return true, nil
 }
 
-func (e *engine) nextRound(head *types.Block) (RoundState, *big.Int) {
+func (e *engine) nextRound(chain RoRoRoChainReader, head *types.Block) (RoundState, *big.Int) {
 
 	e.roundNumberC.L.Lock()
+
+	if head == nil {
+		head = chain.CurrentBlock()
+	}
 
 	e.roundNumber = big.NewInt(0).Set(head.Number())
 	e.roundNumber.Add(e.roundNumber, big.NewInt(1))
@@ -454,8 +484,35 @@ func (e *engine) nextRound(head *types.Block) (RoundState, *big.Int) {
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
 
+	// First, seed the random sequence for the round from the block seed.
+	var seed []byte
+	if head.Number().Cmp(big0) > 0 {
+		// There is no RRR seal on the genesis block
+		se, _, _, err := e.decodeHeaderSeal(head.Header())
+		if err != nil {
+			e.logger.Info("RoRoRo nextRound - failed to decode header seal, will be inactive this round", "err", err)
+			return RoundStateInactive, roundNumber
+		}
+		seed = se.Seed
+	} else {
+		seed = e.genesisEx.ChainInit.Seed
+	}
+
+	if len(seed) != 8 {
+		e.logger.Info("RoRoRo nextRound - seed wrong length, will be inactive this round", "len", len(seed))
+		return RoundStateInactive, roundNumber
+	}
+
+	rand.Seed(int64(binary.LittleEndian.Uint64(seed)))
+
 	// If we are a leader candidate we need to broadcast an intent.
-	e.candidates, e.endorsers = e.selectCandidatesAndEndorsers()
+	var err error
+	e.candidates, e.endorsers, err = e.selectCandidatesAndEndorsers(chain, head)
+	if err != nil {
+		e.logger.Info("RoRoRo nextRound - selection failed, will be inactive this round", "err", err)
+		return RoundStateInactive, roundNumber
+	}
+
 	e.logger.Info("RoRoRo selection updated", "cans", len(e.candidates), "ends", len(e.endorsers))
 	if !e.candidates[e.nodeAddr] {
 		if !e.endorsers[e.nodeAddr] {
@@ -583,34 +640,6 @@ func (e *engine) newPendingIntent(et *engSealTask, seq uint) (*pendingIntent, er
 	pe.Endorsers = make(map[common.Address]bool)
 
 	return pe, nil
-}
-
-// selectCandidatesAndEndorsers determines if the current node is a leader
-// candidate and what the current endorsers are
-func (e *engine) selectCandidatesAndEndorsers() (map[common.Address]bool, map[common.Address]bool) {
-
-	// XXX: This must ultimately to SelectCandiates AND SelectEndorsers then
-	// decide if the current node is in the results of SelectCandatates
-
-	// XXX: TODO active endorsers/leaders. To get going, return everyone in
-	// the genesis extradata  except the local node
-
-	// XXX: fixed leader until we get the endorsments working
-
-	endorsers := map[common.Address]bool{}
-	for i, en := range e.genesisEx.IdentInit {
-		addr := common.Address(en.U.Address())
-		if i == 0 {
-			continue
-		}
-		endorsers[addr] = true
-	}
-
-	// XXX: leader is first genesis node for now
-	candidates := map[common.Address]bool{}
-	candidates[common.Address(e.genesisEx.IdentInit[0].U.Address())] = true
-
-	return candidates, endorsers
 }
 
 // broadcastCurrentIntent gossips the signed intent for the currently pending

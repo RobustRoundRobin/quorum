@@ -3,6 +3,7 @@ package rororo
 import (
 	"crypto/ecdsa"
 	"io"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -19,21 +20,42 @@ type GenesisExtraData struct {
 	ChainID Hash // EncodeRLP fills this in automatically
 }
 
-// IdentInit creates, or extends, the identity initialisation vector for the extraData in
-// the genesis block. init is nil or the currently included identities. One or
-// more nodeids are passes as the trailing parameters. The updated init vector
-// is returned. See EIP-rororo/extraData of Block0
+// IdentInit creates, or extends, the identity initialisation vector for the
+// extraData in the genesis block. init is nil or the currently included
+// identities. One or more nodeids are passed as the trailing parameters. The
+// updated init vector is returned. See EIP-rororo/extraData of Block0
 func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrolment, error) {
 
 	start := len(init)
 	init = append(init, make([]Enrolment, len(nodeids))...)
 
+	// Use a mostly empty binding for genesis. We do to limit the special
+	// handling for the genesis block when validating enrolments.
+	eb := &EnrolmentBinding{
+		Round: big.NewInt(0),
+	}
+
 	for i, id := range nodeids {
-		err := init[start+i].Q.Fill(ck, id)
+
+		eb.NodeID = id
+		u, err := eb.U()
+		if err != nil {
+			return nil, err
+		}
+
+		// XXX: Individualy signing enrolments like this is redundant for this
+		// implementation. It is always going to be the block sealer key
+		// 'attesting' each identity enroled in a block. And that key signs the
+		// whole block header. But we do it regardless - for alignment with
+		// future posibilities and because it is actually quite convenient in
+		// other places.
+		err = init[start+i].Q.Fill(ck, u)
 		if err != nil {
 			return init, err
 		}
-		copy(init[start+i].U[:], id[:])
+
+		copy(init[start+i].U[:], u[:])
+		copy(init[start+i].ID[:], id[:])
 	}
 	return init, nil
 }

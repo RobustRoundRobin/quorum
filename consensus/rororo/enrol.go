@@ -8,7 +8,7 @@ import (
 )
 
 // Quote is the 'pseudo' attestation of identity performed using node private
-// keys rather than SGX. See EIP-rororo 'extraData of Block0' and 'Enrolment
+// keys rather than SGX. See RRR-spec 'extraData of Block0' and 'Enrolment
 // data'. It is only the "Quote" refrenced in the original paper in so far as
 // it will be the Qi that gets included in Block0 or in Enroln messages.  It's
 // an ecdsa signature the [R || S || V] format
@@ -17,6 +17,12 @@ type Quote [65]byte
 type Enrolment struct {
 	Q Quote
 	U Hash // nodeid for genesis, EnrolmentBinding.U() otherwise
+
+	// ID can be verified by reconstructing an EnrolmentBinding, getting its
+	// hash, comparing that hash with U (above) and then checking that the
+	// public key for the node that sealed the block with the Enrolment can
+	// verify the quote.
+	ID Hash // must be verified by re-creating an Enrol
 }
 
 // Fill intitialises a Quote for an identity to be enroled on the chain.
@@ -44,9 +50,9 @@ func (q *Quote) Fill(a *ecdsa.PrivateKey, u Hash) error {
 // is the current round of consensus. blockHash identifies the current head of
 // the chain (selected branch)
 func (q *Quote) EnrolIdentity(
-	a *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round *big.Int, blockHash Hash) error {
+	a *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round *big.Int, blockHash Hash, reEnrol bool) error {
 	e := EnrolmentBinding{
-		ChainID: chainID, NodeID: nodeid, Round: round, BlockHash: blockHash}
+		ChainID: chainID, NodeID: nodeid, Round: round, BlockHash: blockHash, ReEnrol: reEnrol}
 	u, err := e.U()
 	if err != nil {
 		return err
@@ -61,6 +67,7 @@ type EnrolmentBinding struct {
 	NodeID    Hash     // NodeID is defined by ethereum as keccak 256 ( PublicKey X || Y )
 	Round     *big.Int // Round is the consensus round
 	BlockHash Hash     // BlockHash is the block hash for the head of the selected chain branch
+	ReEnrol   bool     // true if the identity has been enroled before.
 }
 
 // U encodes the userdata hash to sign for the enrolment.
@@ -86,8 +93,7 @@ func (q *Quote) RecoverPublic(u Hash) (*ecdsa.PublicKey, error) {
 // RecoverID recovers the attestors identity from the signature and the
 // identity (public key) of the quoted node
 func (q *Quote) RecoverID(u Hash) (Hash, error) {
-	// XXX: TODO think Keccak256 call is wrong here, we just want u[:] directly
-	p, err := Ecrecover(Keccak256(u[:]), q[:])
+	p, err := Ecrecover(u[:], q[:])
 	if err != nil {
 		return Hash{}, err
 	}

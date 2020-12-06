@@ -2,6 +2,7 @@ package rororo
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"errors"
@@ -157,6 +158,23 @@ type engine struct {
 	intentSeq     uint // ensures we re-issue the intent even if the round doesn't change
 	intentMsgHash Hash // we remember the most recent intent hash, even if the intent is cleared, to help with telemetry
 	intent        *pendingIntent
+
+	// seniority  is maintained in identity age order - with the youngest at
+	// the front.
+	seniority *list.List             // list of *idActive
+	aged      map[Hash]*list.Element // map of NodeID -> Element in active
+
+	// When updating activity, we walk back from the block we are presented
+	// with. We ERROR if we reach a block number lower than lastBlockNumberSeen
+	// without matching the hash - that is a branch and we haven't implemented
+	// SelectBranch yet.
+	lastBlockSeen       Hash
+	lastBlockNumberSeen *big.Int
+
+	// idle are the set of identities that have not been active in the last Ta
+	// block rounds. It is not maintained in any particular order.
+	idle *list.List
+
 	// These get updated each round on all nodes without regard to which are
 	// leaders/endorsers or participants.
 	candidates map[common.Address]bool
@@ -196,6 +214,10 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 		// Broadcast is called on every round change
 		roundNumberMu: sync.RWMutex{},
 		roundNumber:   big.NewInt(0),
+
+		aged:                make(map[Hash]*list.Element),
+		lastBlockSeen:       Hash{},
+		lastBlockNumberSeen: nil,
 	}
 	e.roundNumberC = sync.NewCond(&e.roundNumberMu)
 
@@ -231,13 +253,13 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 		return true, err
 	}
 
-	e.logger.Debug("RoRoRo HandleMsg", "#msg", msgHash.Hex(), "#raw", Keccak256Hash(rmsg.Raw).Hex())
+	e.logger.Trace("RoRoRo HandleMsg", "#msg", msgHash.Hex(), "#raw", Keccak256Hash(rmsg.Raw).Hex())
 
 	// Note: it is the msgHash we want here, not the raw hash. We want it to be
 	// possible for leader candidates to request a re-evaluation of the same
 	// block proposal. Otherwise they can get stuck in small network scenarios.
 	if seen := e.updateInboundMsgTracking(peerAddr, msgHash); seen {
-		e.logger.Debug("RoRoRo HandleMsg - ignoring previously seen")
+		e.logger.Trace("RoRoRo HandleMsg - ignoring previously seen")
 		return true, nil
 	}
 
@@ -251,7 +273,7 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 			return true, err
 		}
 
-		e.logger.Debug("RoRoRo HandleMsg - post engSignedIntent")
+		e.logger.Trace("RoRoRo HandleMsg - post engSignedIntent")
 		e.runningCh <- si
 
 		return true, nil
@@ -268,7 +290,7 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 			return true, err
 		}
 
-		e.logger.Debug("RoRoRo HandleMsg - post engSignedEndorsement")
+		e.logger.Trace("RoRoRo HandleMsg - post engSignedEndorsement")
 		e.runningCh <- sc
 
 		return true, nil
@@ -281,7 +303,7 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 // Send the message to the peer - if its hash is not in the ARU cache for the
 // peer
 func (e *engine) Send(peerAddr common.Address, msg []byte) error {
-	e.logger.Debug("RoRoRo Send")
+	e.logger.Trace("RoRoRo Send")
 
 	msgHash := Keccak256Hash(msg)
 
@@ -301,12 +323,11 @@ func (e *engine) Send(peerAddr common.Address, msg []byte) error {
 func (e *engine) Broadcast(self common.Address, peers map[common.Address]consensus.Peer, msg []byte) error {
 
 	msgHash := Keccak256Hash(msg)
-	// e.logger.Debug("RoRoRo messaging broadcasting msg", "hash", hex.EncodeToString(msgHash[:]))
 
 	for peerAddr, peer := range peers {
 
 		if peerAddr == self {
-			e.logger.Debug("RoRoRo Broadcast - skipping self")
+			e.logger.Trace("RoRoRo Broadcast - skipping self")
 			continue
 		}
 
@@ -339,7 +360,7 @@ func (e *engine) peerSend(
 	msgs.Add(msgHash, true)
 	e.peerMessages.Add(peerAddr, msgs)
 
-	e.logger.Debug("RoRoRo peerSend - sending", "hash", msgHash.Hex(), "safe-hash", Keccak256Hash(msg).Hex())
+	e.logger.Trace("RoRoRo peerSend - sending", "hash", msgHash.Hex(), "safe-hash", Keccak256Hash(msg).Hex())
 
 	// Send will error imediately on encoding problems. But otherwise it
 	// will block until the receiver consumes the message or the send times
@@ -419,8 +440,8 @@ func (e *engine) RoundNumber() *big.Int {
 
 func (e *engine) Start(
 	reader consensus.ChainReader) error {
-	e.logger.Info("RoRoRo Start")
 	e.stop()
+	e.logger.Info("RoRoRo Start")
 
 	chain, ok := reader.(RoRoRoChainReader)
 	if !ok {
@@ -429,37 +450,8 @@ func (e *engine) Start(
 
 	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
 
-	// When Start is called we can be sure that everything we need is ready. So
-	// we process the genesis extra data here.
-	hg := chain.GetHeaderByNumber(0)
-	if hg == nil {
-		return errNoGenesisHeader
-	}
-	e.logger.Info("genesis block", "extra", hex.EncodeToString(hg.Extra))
-	err := rlp.DecodeBytes(hg.Extra, &e.genesisEx)
-	if err != nil {
+	if err := e.primeActivitySelection(chain); err != nil {
 		return err
-	}
-
-	signerPub, err := e.genesisEx.IdentInit[0].U.SignerPub(e.genesisEx.IdentInit[0].Q[:])
-	signerAddr := crypto.PubkeyToAddress(*signerPub)
-	fmt.Printf("signer-addr: %s\n", signerAddr.Hex())
-	fmt.Printf("signer-addr: %s\n", hex.EncodeToString(e.genesisEx.IdentInit[0].U[12:]))
-
-	signerNodeID, err := e.genesisEx.IdentInit[0].U.SignerNodeID(e.genesisEx.IdentInit[0].Q[:])
-	if err != nil {
-		return err
-	}
-	var foundGenesisSigner bool
-	for _, en := range e.genesisEx.IdentInit {
-		if en.U == signerNodeID {
-			foundGenesisSigner = true
-			e.logger.Info("genesis", "signer nodeid", en.U.Hex())
-			break
-		}
-	}
-	if !foundGenesisSigner {
-		return fmt.Errorf("genesis identity signer not enroled")
 	}
 
 	e.runningCh = make(chan interface{})
@@ -569,6 +561,7 @@ func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) erro
 	header.Extra = extra
 	// this is just the block number for rororo
 	header.Difficulty = header.Number
+
 	return nil
 }
 

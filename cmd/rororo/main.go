@@ -116,10 +116,10 @@ func genextra(ctx *cli.Context) error {
 	extra := &rororo.GenesisExtraData{}
 
 	// XXX: TODO cli option to provide explicit seed
-	seed := make([]byte, 32)
+	seed := make([]byte, 8)
 	var nrand int
 	nrand, err = rand.Read(seed)
-	if err != nil || nrand != 32 {
+	if err != nil || nrand != 8 {
 		return fmt.Errorf("failed reading random seed")
 	}
 

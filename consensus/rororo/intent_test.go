@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIntentVerify(t *testing.T) {
+func TestIntentDecodeSigned(t *testing.T) {
 	require := require.New(t)
 
 	k, err := crypto.GenerateKey()
