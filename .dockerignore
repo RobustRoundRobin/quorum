@@ -1,5 +1,10 @@
+.git*
 **/*_test.go
-
+**/*.pdf
+**/*.png
+docs
 build/_workspace
 build/_bin
 tests/testdata
+accounts/keystore/testdata
+

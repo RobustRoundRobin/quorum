@@ -351,7 +351,7 @@ func (e *engine) handleEndorsement(et *engSignedEndorsement) error {
 	// quorum size
 	if uint64(len(e.intent.Endorsements)) >= e.config.EndorsersQuorum {
 		e.logger.Info("RoRoRo confirmation redundant, have quorum",
-			"endid", et.Endorsement.EndorserID.Hex(), et.SignedEndorsement.IntentHash.Hex(),
+			"endid", et.Endorsement.EndorserID.Hex(), "end#", et.SignedEndorsement.IntentHash.Hex(),
 			"hintent", et.SignedEndorsement.IntentHash.Hex())
 		return nil
 	}
@@ -478,7 +478,7 @@ func (e *engine) nextRound(chain RoRoRoChainReader, head *types.Block) (RoundSta
 	e.roundNumber.Add(e.roundNumber, big.NewInt(1))
 	roundNumber := big.NewInt(0).Set(e.roundNumber)
 
-	e.roundNumberC.L.Unlock()
+	e.roundNumberC.L.Unlock() // don't defer this
 	e.roundNumberC.Broadcast()
 
 	e.intentMu.Lock()
@@ -503,17 +503,18 @@ func (e *engine) nextRound(chain RoRoRoChainReader, head *types.Block) (RoundSta
 		return RoundStateInactive, roundNumber
 	}
 
-	rand.Seed(int64(binary.LittleEndian.Uint64(seed)))
+	// We record it in e only for telemetry, this is the only place it gets set.
+	e.roundSeed = int64(binary.LittleEndian.Uint64(seed))
+	rand.Seed(e.roundSeed)
 
 	// If we are a leader candidate we need to broadcast an intent.
 	var err error
 	e.candidates, e.endorsers, err = e.selectCandidatesAndEndorsers(chain, head)
 	if err != nil {
-		e.logger.Info("RoRoRo nextRound - selection failed, will be inactive this round", "err", err)
+		e.logger.Info("RoRoRo nextRound - select failed, skipping round", "err", err)
 		return RoundStateInactive, roundNumber
 	}
 
-	e.logger.Info("RoRoRo selection updated", "cans", len(e.candidates), "ends", len(e.endorsers))
 	if !e.candidates[e.nodeAddr] {
 		if !e.endorsers[e.nodeAddr] {
 			e.logger.Info("RoRoRo not a candidate leader or endorser")

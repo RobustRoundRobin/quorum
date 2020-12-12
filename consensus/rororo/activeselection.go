@@ -1,15 +1,12 @@
 package rororo
 
 import (
-	"bytes"
 	"container/list"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
-	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -20,20 +17,22 @@ import (
 var (
 	errEnrolmentInvalid           = errors.New("identity enrolment could not be verified")
 	errGensisIdentitiesInvalid    = errors.New("failed to enrol the identities from the genesis block")
-	errGensisIdentityNotEnroled   = errors.New("the identity that attested the gensis block is not enroled in the genesis block")
+	errGensisIdentityNotEnroled   = errors.New("the identity that attested the gensis block is not enrolled in the genesis block")
 	errEnrolmentNotSignedBySealer = errors.New("identity enrolment was not indidualy signed by the block sealer")
 	errEnrolmentIsKnown           = errors.New("new identity (not flagged for re-enrolment) is known")
 	errBranchDetected             = errors.New("branch detected and we haven't implemented select branch")
+	errInsuficientActiveIdents    = errors.New("not enough active identities found")
 	big0                          = big.NewInt(0)
+	zeroAddr                      = Address{}
 	zeroHash                      = Hash{}
 )
 
 // idActivity is used to cache the 'age' and 'activity' of RRR identities.
 //
 // * In normal operation 'age' is the number of blocks since an identity last minted
-// * When an identity is first enroled, and so has not minted yet, 'age' is
-//   number of blocks since they were enroled.
-// * A node is 'active' in the round (block) that enroled (or re-enroled) it.
+// * When an identity is first enrolled, and so has not minted yet, 'age' is
+//   number of blocks since they were enrolled.
+// * A node is 'active' in the round (block) that enrolled (or re-enrolled) it.
 // * A node is 'active' in any round (block) that it signed an intent endorsement in.
 //
 // 	"In case multiple candidates have the same age (i.e., they were enrolled in
@@ -50,7 +49,7 @@ type idActivity struct {
 	ageHash Hash
 
 	// ageBlock is the number of the block most recently minted by the
-	// identity OR the block the identity was enroled on - udpated by
+	// identity OR the block the identity was enrolled on - udpated by
 	// esbalishAge
 	ageBlock *big.Int
 
@@ -70,7 +69,7 @@ type idActivity struct {
 	// order in the block that the identities enrolment appeared.  The first
 	// time an identity is selected, it has not minted so it is conceivable
 	// that its 'age' is the same as another leader candidate (because they
-	// were enroled on the same block and they both have not minted). In this
+	// were enrolled on the same block and they both have not minted). In this
 	// case, the order is the tie breaker. Once the identity mints, order is
 	// set to zero. order is initialised to zero for the genesis identity.
 	order int
@@ -87,8 +86,7 @@ func (e *engine) primeActivitySelection(chain RoRoRoChainReader) error {
 		return errNoGenesisHeader
 	}
 
-	h0 := Hash{}
-	if e.genesisEx.ChainID == h0 {
+	if e.genesisEx.ChainID == zeroHash {
 		// geth warmup will call VerifyBranchHeaders on the genesis block
 		// before doing anything else. This guard simply avoids an anoying and
 		// redundant log message, whilst also guarding against changes in the
@@ -100,9 +98,7 @@ func (e *engine) primeActivitySelection(chain RoRoRoChainReader) error {
 		}
 	}
 
-	e.seniority = list.New()
-
-	hashGen := Hash(hg.Hash())
+	e.activeSelection = list.New()
 
 	// All of the enrolments in the genesis block are signed by the long term
 	// identity key (node key) of the genesis node.
@@ -116,12 +112,7 @@ func (e *engine) primeActivitySelection(chain RoRoRoChainReader) error {
 
 	e.logger.Debug("RoRoRo primeActivitySelection", "genid", genID.Hex(), "genpub", hex.EncodeToString(genPub))
 
-	// signerPub, err := e.genesisEx.IdentInit[0].U.SignerPub(e.genesisEx.IdentInit[0].Q[:])
-	// signerAddr := crypto.PubkeyToAddress(*signerPub)
-	// fmt.Printf("signer-addr: %s\n", signerAddr.Hex())
-	// fmt.Printf("signer-addr: %s\n", hex.EncodeToString(e.genesisEx.IdentInit[0].U[12:]))
-
-	// We require the identity that signed the gensis block to also be enroled
+	// We require the identity that signed the gensis block to also be enrolled
 	// in the block.
 	var foundGenesisSigner bool
 	for _, en := range e.genesisEx.IdentInit {
@@ -134,15 +125,30 @@ func (e *engine) primeActivitySelection(chain RoRoRoChainReader) error {
 		return fmt.Errorf("genid=`%s':%w", genID.Hex(), errGensisIdentityNotEnroled)
 	}
 
-	if err = e.enrolIdentities(genID, genPub, e.genesisEx.IdentInit, hashGen, big0); err != nil {
-		return err
+	// If we have just started up. Position lastBlockSeen such that it
+	// encompasses the block range required by Ta 'active'. This ensures we
+	// always warm up our picture of activity consistently. See
+	// selectCandidatesAndEndorsers
+
+	head := chain.CurrentBlock()
+	// horizon = head - activity
+	headNumber := big.NewInt(0).Set(head.Number())
+	horizon := headNumber.Sub(headNumber, big.NewInt(int64(e.config.Activity)))
+	if horizon.Cmp(big0) < 0 {
+		horizon.SetInt64(0)
 	}
+	e.activeBlockFence = horizon
+
+	// Notice that we _do not_ record the hash here, we leave that to
+	// accumulateActive, which will then correctly deal with collecting the
+	// 'activity' in the genesis block.
 
 	return nil
 }
 
 func (e *engine) enrolIdentities(
-	sealerID Hash, sealerPub []byte, enrolments []Enrolment, block Hash, number *big.Int) error {
+	fence *list.Element, sealerID Hash, sealerPub []byte, enrolments []Enrolment, block Hash, number *big.Int,
+) error {
 
 	enbind := &EnrolmentBinding{
 		Round: big.NewInt(0),
@@ -177,15 +183,18 @@ func (e *engine) enrolIdentities(
 		}
 
 		// XXX: We ignore the re-enrol flag for now. Strictly, if re-enrol is
-		// false we need to ensure that the identityjkIf we just check the
-		// memory cache, it can lead to situtations where the 'age' is
-		// different on diffent nodes.
+		// false we need to ensure that the identity is genuinely new.
 		// if !reEnrol {
 
 		return true, nil
 	}
 
-	for order, enr := range enrolments {
+	// The 'youngest' enrolment in the block is the last in the slice. And it
+	// is essential that we refreshAge youngest -> oldest
+	for i := 0; i < len(enrolments); i++ {
+
+		order := len(enrolments) - i - 1 // the last enrolment is the youngest
+		enr := enrolments[order]
 
 		// the usual case once we are up and running is re-enrolment so we try
 		// it first.
@@ -205,53 +214,145 @@ func (e *engine) enrolIdentities(
 				sealerID.Hex(), enr.ID.Hex(), enr.U.Hex(), errEnrolmentInvalid)
 		}
 
-		e.establishAge(enr.ID, block, number, order)
+		e.refreshAge(fence, enr.ID, block, number, order)
 	}
 	return nil
 }
 
-// getIDActivity returns the activity record for the identity.
-// * If the identity is absent it is created at the front.
-// * If peek is false, the identy is moved to the front of the active list.
-// * If the record is new, the nodeID is set and the block numbers are initialised to big 0's
-func (e *engine) getIDActivity(nodeID Hash, peek bool) *idActivity {
+func newIDActivity(nodeID Hash) *idActivity {
+	return &idActivity{
+		nodeID:        nodeID,
+		ageBlock:      big.NewInt(0),
+		endorsedBlock: big.NewInt(0),
+	}
+}
+
+// recordActivity is called for a node to indicate it is active in the current
+// round. Inactive entries are culled by selectCandidatesAndEndorsers
+func (e *engine) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big.Int) *idActivity {
 
 	var aged *idActivity
-	if el, ok := e.aged[nodeID]; ok {
-		if !peek {
-			e.seniority.MoveToFront(el)
-		}
+	nodeAddr := nodeID.Address()
+	if el := e.aged[nodeAddr]; el != nil {
+		// Easy case, we simply don't have to care about age at all, it is what
+		// it is.
 		aged = el.Value.(*idActivity)
 	} else {
-		aged = &idActivity{
-			ageBlock:      big.NewInt(0),
-			endorsedBlock: big.NewInt(0),
-		}
-		// If its new, it goes at the front regardless of peek
-		e.aged[nodeID] = e.seniority.PushFront(aged)
+
+		// Interesting case, activity from an identity whose enrolment we
+		// haven't seen yet. We put the new entry straight onto the idle set.
+		// refreshAge (below) will pluck it out of the idle set if it is
+		// encountered within HEAD - Ta
+
+		aged = newIDActivity(nodeID)
+		e.idlePool[nodeAddr] = aged
 	}
+	aged.endorsedHash = endorsed
+	aged.endorsedBlock.Set(blockNumber)
+
 	return aged
 }
 
-// establishAge updates the age for a node, marks it has having been active in
-// the block round, and resets its oldestFor counter. ageBlock and
-// endorsedBlock are not changed - the identity has neither minted nor endorsed
-func (e *engine) establishAge(nodeID Hash, block Hash, blockNumber *big.Int, order int) {
+// return the hex string formed from the first head 'h' bytes, and last tail 't' bytes as hex,
+// formatted with a single '.'. h and t are clamped to len(Address) / 2 - 1
+func fmtAddrex(addr Address, h, t int) string {
 
-	// (re-)enrolment counts as being active for the block round. And
-	// re-enrolment sets the age to zero (puts it at the front of the active
-	// list)
-	aged := e.getIDActivity(nodeID, false /*peek*/)
-	aged.nodeID = nodeID
+	if h < 1 && t < 1 {
+		return ""
+	}
+	if h < 0 {
+		h = 0
+	}
+	if t < 0 {
+		t = 0
+	}
+
+	if t > len(addr)-h-1 {
+		t = len(addr) - h - 1
+	}
+
+	if h > len(addr)-t-1 {
+		h = len(addr) - t - 1
+	}
+
+	start := addr[:h]
+	end := addr[len(addr)-t:]
+
+	return fmt.Sprintf("%s.%s", hex.EncodeToString(start), hex.EncodeToString(end))
+}
+
+// refreshAge called to indicate that nodeID has minted a block or been
+// enrolled. If this is the youngest block minted by the identity, we move its
+// entry after the fence.  Counter intuitively, we always insert the at the
+// 'oldest' position. Because accumulateActive works from the head (youngest)
+// towards genesis.  If no fence is provided the entry is added at the back
+// (oldest position). If a fence is provided, the entry is added immediately
+// after the fence - which is the oldest position *after* the fence.
+// accumulateActive uses the last block it saw as the fence. enrolIdentities
+// processes enrolments for a block in reverse order of age. These two things
+// combined give us an efficient way to always have identities sorted in age
+// order.
+func (e *engine) refreshAge(
+	fence *list.Element, nodeID Hash, block Hash, blockNumber *big.Int, order int,
+) {
+	var aged *idActivity
+
+	nodeAddr := nodeID.Address()
+	if el := e.aged[nodeAddr]; el != nil {
+
+		aged = el.Value.(*idActivity)
+
+		// If the last block we saw for this identity is older, we need to
+		// reset the age by moving it after the fence. Otherwise, we assume we
+		// have already processed it and it is in the appropriate place.
+		if aged.ageBlock.Cmp(blockNumber) <= 0 {
+
+			e.logger.Trace("RoRoRo refreshAge - move",
+				"addr", nodeAddr.Hex(), "age", fmt.Sprintf("%2d.%d->%d", order, aged.ageBlock, blockNumber))
+
+			if fence != nil {
+				// This is effectively MoveToBack, with fence as the logical back.Prev()
+				e.activeSelection.MoveAfter(el, fence)
+			} else {
+				e.activeSelection.MoveToBack(el)
+			}
+			aged.ageBlock.Set(blockNumber)
+			aged.ageHash = block
+			aged.oldestFor = 0
+			aged.order = order
+		}
+
+	} else {
+
+		// If it was enrolled within HEAD - Ta and has been active, it will be
+		// in the idle pool because the age wasn't known when the activity was
+		// seen by recordActivity. In either event there is no previous age.
+		if aged = e.idlePool[nodeAddr]; aged != nil {
+			e.logger.Trace("RoRoRo refreshAge - from idle", "addr", nodeAddr.Hex(), "age", fmt.Sprintf("%02d.%05d", order, blockNumber))
+		} else {
+			e.logger.Trace("RoRoRo refreshAge - new", "addr", nodeAddr.Hex(), "age", fmt.Sprintf("%02d.%05d", order, blockNumber))
+			aged = newIDActivity(nodeID)
+		}
+		delete(e.idlePool, nodeAddr)
+
+		aged.ageBlock.Set(blockNumber)
+		aged.ageHash = block
+		aged.oldestFor = 0
+		aged.order = order
+
+		if fence != nil {
+			// This is effectively PushBack, with fence as the logical back.Prev()
+			e.aged[nodeAddr] = e.activeSelection.InsertAfter(aged, fence)
+		} else {
+			e.aged[nodeAddr] = e.activeSelection.PushBack(aged)
+		}
+	}
 
 	// Setting ageBlock resets the age of the identity. The test for active is
 	// sensitive to this. If endorsedBlock for an identity is outside of Ta,
 	// then it is still considered 'active' if ageBlock is inside Ta.
 	// Re-enrolment is how the current leader re-activates idle identities.
-	aged.ageBlock.Set(blockNumber)
-	aged.ageHash = block
-	aged.oldestFor = 0
-	aged.order = order
+
 	if blockNumber.Cmp(big0) == 0 {
 		aged.genesisOrder = order
 	}
@@ -259,11 +360,15 @@ func (e *engine) establishAge(nodeID Hash, block Hash, blockNumber *big.Int, ord
 
 // Is the number within Ta blocks of the block head ?
 func (e *engine) withinActivityHorizon(n *big.Int) bool {
-	depth := e.lastBlockNumberSeen.Sub(e.lastBlockNumberSeen, n)
+
+	// Note that activeBlockFence is intialised to the head block in Start
+
+	depth := big.NewInt(0).Set(e.activeBlockFence)
+	depth.Sub(depth, n)
 	if !depth.IsUint64() {
 		e.logger.Trace(
 			"RoRoRo blockWithinActivityHorizon - -ve depth",
-			"Ta", e.config.Activity, "n", n, "last", e.lastBlockNumberSeen)
+			"Ta", e.config.Activity, "n", n, "last", e.activeBlockFence)
 		return false
 	}
 	if depth.Uint64() > e.config.Activity {
@@ -272,7 +377,11 @@ func (e *engine) withinActivityHorizon(n *big.Int) bool {
 	return true
 }
 
-func (e *engine) activityUpdate(chain RoRoRoChainReader, head *types.Header) error {
+// accumulateActive is effectively SelectActive from the paper, but with the
+// 'obvious' caching optimisations. AND importantly we only add active
+// identities to the active set here, we do not cull idles. That is left to
+// selectCandidatesAndEndorsers.
+func (e *engine) accumulateActive(chain RoRoRoChainReader, head *types.Header) error {
 
 	if head == nil {
 		return nil
@@ -282,170 +391,277 @@ func (e *engine) activityUpdate(chain RoRoRoChainReader, head *types.Header) err
 		return nil
 	}
 
-	next := head
-	headNumber := big.NewInt(0).Set(head.Number) // because Sub modifies self
+	cur := head
 
+	youngestKnown := e.activeSelection.Front()
+
+	// Record activity of all blocks until we reach the genesis block or
+	// until we reach a block we have recorded already. We are traversing
+	// 'youngest' block to 'oldest'. We remember the last block seen on the
+	// last traversal and use it as our fence.  We insert all block enrolments
+	// (also in reverse order) immediately after the fence. This maintains the
+	// list in descending age order back -> front (see the spec for a less
+	// dense description) Note the sealer is considered older than all of the
+	// identities it enrolls.
 	for {
 
-		// Record activity of all blocks until we reach the genesis block or
-		// until we reach a block we have recorded already.
-		if next == nil {
-			if e.lastBlockSeen != zeroHash || e.lastBlockNumberSeen != nil && e.lastBlockNumberSeen.Cmp(big0) != 0 {
-				return fmt.Errorf("reached and of chain without finding previously seen: %w", errBranchDetected)
-			}
-			e.logger.Debug("RoRoRo activityUpdate - complete, no more blocks")
-			break
-		}
-
-		h := Hash(next.Hash())
+		h := Hash(cur.Hash())
 
 		// Reached the last block we updated for, we are done
 		if h == e.lastBlockSeen {
-			e.logger.Trace("RoRoRo activityUpdate - complete, reached last seen", "#", h.Hex())
+			e.logger.Trace("RoRoRo accumulateActive - complete, reached last seen", "#", h.Hex())
 			break
 		}
 
-		// If we have exceded the Ta depth horizon we are done.
-		depth := headNumber.Sub(headNumber, next.Number)
+		// If we have exceeded the Ta depth horizon we are done. Note we do this
+		// directly on the number in the header and the activity, rather than
+		// relying on the cached activeBlockFence.
+		headNumber := big.NewInt(0).Set(head.Number) // because Sub modifies self
+		depth := headNumber.Sub(headNumber, cur.Number)
 		if !depth.IsUint64() || depth.Uint64() > e.config.Activity {
-			e.logger.Trace("RoRoRo activityUpdate - complete, reached activity depth", "Ta", e.config.Activity)
+			e.logger.Trace("RoRoRo accumulateActive - complete, reached activity depth", "Ta", e.config.Activity)
 			break
 		}
 
-		// If the hash didn't match and yet the number is less than or equal
-		// the last we processed, we have encountered a branch, and we don't
-		// have SelectBranch yet.
-		if e.lastBlockNumberSeen != nil && next.Number.Cmp(e.lastBlockNumberSeen) <= 0 {
+		// Now we look at the activeBlockFence. If the number is at or beyond the
+		// fence and we haven't matched the hash yet it means we have
+		// inconsistent results. The exception accommodates the first pass after
+		// node startup.
+		if e.lastBlockSeen != zeroHash && cur.Number.Cmp(e.activeBlockFence) <= 0 && head.Number.Cmp(big0) != 0 {
 			return fmt.Errorf("reached a lower block without matching hash of last seen: %w", errBranchDetected)
 		}
 
-		confirms, enrols, sealerID, sealerPub, err := e.decodeActivity(next)
+		confirms, enrols, sealerID, sealerPub, err := e.decodeActivity(cur)
 		if err != nil {
 			return err
 		}
 
-		// Update the age of the minter
-		e.establishAge(sealerID, h, next.Number, 0)
+		// telemetry only
+		if sealer := e.aged[sealerID.Address()]; sealer != nil {
+			age := sealer.Value.(*idActivity)
+			var agemsg string
+			if age.ageBlock.Cmp(cur.Number) < 0 {
+				agemsg = fmt.Sprintf("%02d.%d->%d", age.order, age.ageBlock, cur.Number)
+			} else {
+				agemsg = fmt.Sprintf("%02d.%05d", age.order, cur.Number)
+			}
 
-		// Do any enrolments. (Re) Enroling an identity moves it to the
+			e.logger.Debug(
+				"RoRoRo accumulateActive - sealer",
+				"addr", sealerID.Address().Hex(), "age", agemsg)
+		} else {
+			// first block from this sealer since it went idle or was first
+			// enrolled. if it went idle we could have seen an endorsement for
+			// it but we haven't, if it is new this will be the first encounter
+			// with the identity.
+			e.logger.Debug(
+				"RoRoRo accumulateActive - new sealer",
+				"addr", sealerID.Address().Hex(), "age", fmt.Sprintf("00.%05d", cur.Number))
+		} // end telemetry only
+
+		// The sealer is minting and to preserve the "round" ordering, needs to
+		// move to the youngest position - before the identities that may be
+		// enrolled.
+		e.refreshAge(youngestKnown, sealerID, h, cur.Number, 0)
+
+		// Do any enrolments. (Re) Enrolling an identity moves it to the
 		// youngest position in the activity set
-		e.enrolIdentities(sealerID, sealerPub, enrols, h, next.Number)
+		e.enrolIdentities(youngestKnown, sealerID, sealerPub, enrols, h, cur.Number)
 
 		// The endorsers are active, they do not move in the age ordering.
+		// Note however, for any identity enrolled after genesis, as we are
+		// walking youngest -> oldest we may/probably will encounter
+		// confirmations before we see the enrolment. For that to happen, the
+		// identity must have been enrolled within Ta of this *cur* block else
+		// it could not have been selected as an endorser. However, it may not
+		// be within Ta of where we started accumulateActive
 		for _, end := range confirms {
-			endorserAge := e.getIDActivity(end.EndorserID, true /*peek: age position un-changed*/)
-			endorserAge.endorsedHash = h
-			endorserAge.endorsedBlock.Set(next.Number)
+			// xxx: should probably log when we see a confirmation for an
+			// enrolment we haven't had yet, that is 'interesting'
+			e.recordActivity(end.EndorserID, h, cur.Number)
 		}
 
-		e.logger.Debug("RoRoRo activityUpdate - block processed", "number", next.Number)
-
-		if next.ParentHash == common.Hash(zeroHash) {
-			next = nil
-			continue
+		parentHash := cur.ParentHash
+		if parentHash == common.Hash(zeroHash) {
+			e.logger.Debug("RoRoRo accumulateActive - complete, no more blocks")
+			break
 		}
-		next = chain.GetHeaderByHash(next.ParentHash)
+
+		cur = chain.GetHeaderByHash(parentHash)
+
+		if cur == nil {
+			return fmt.Errorf("block #`%s' not available locally", parentHash.Hex())
+		}
 	}
 
 	e.lastBlockSeen = headHash
-	e.lastBlockNumberSeen = big.NewInt(0).Set(head.Number)
+	e.activeBlockFence = big.NewInt(0).Set(head.Number)
 
 	return nil
 }
 
-// The paper specifies sorting enrolment candidates by public key, the address
-// is more convenient and effectively the same result.
-type Addresses []common.Address
-
-func (s Addresses) Len() int      { return len(s) }
-func (s Addresses) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-
-type ByAddress struct{ Addresses }
-
-func (s ByAddress) Less(i, j int) bool {
-	return bytes.Compare(s.Addresses[i][:], s.Addresses[j][:]) < 0
-}
-
 // selectCandidatesAndEndorsers determines if the current node is a leader
-// candidate and what the current endorsers are
+// candidate and what the current endorsers are. The key requirement of RRR met
+// here  is that the results of this function should be the same on all nodes
+// assuming the start from the same `head'. This is both SelectCandidates and
+// SelectEndorsers from the paper.
 func (e *engine) selectCandidatesAndEndorsers(
 	chain RoRoRoChainReader, head *types.Block) (map[common.Address]bool, map[common.Address]bool, error) {
 
 	header := head.Header()
-	if err := e.activityUpdate(chain, header); err != nil {
+	if err := e.accumulateActive(chain, header); err != nil {
 		return nil, nil, err
 	}
 
-	// start with the oldest identity, and iterate towards the youngest. Move
-	// any inactive identities encountered to the idle set. Gather the Nc
-	// oldest active for this round as we go.
+	// Start with the oldest identity, and iterate towards the youngest. Move
+	// any inactive identities encountered to the idle set (this is the only
+	// place we remove 'inactive' entries from the active set). As we walk the
+	// active list We gather the candidates and the endorsers The candidates
+	// are the Nc first entries, the endorsers the Ne subsequent.
+	//
+	// XXX: NOTICE: divergence (1) A node is a candidate OR an endorser but not
+	// both. The paper allows a candidate to also be an endorser. Discussion
+	// with the author suggests this divergence helps small networks without
+	// undermining the model.
+	//
+	// XXX: NOTICE: divergence (2) The paper specifies that the endorsers be
+	// sorted by public key to produce a stable ordering for selection. But we
+	// get a stable ordering by age naturally. So we use the permutation to
+	// pick the endorser entries by position in the age order sort of active
+	// identities. We can then eliminate the sort and also, usually, terminate
+	// the list scan early.
 	candidates := make(map[common.Address]bool)
-	endsort := make([]common.Address, 0, e.config.Endorsers)
+	endorsers := make(map[common.Address]bool)
 
-	canorder := make([]string, 0, e.config.Candidates) // for telemetry
-	endorder := make(map[common.Address]int)           // needed for telemetry, enrolment order is a proxy for node id
+	// We do some book keeping in the interests of useful logs - it is
+	// essential/very useful to be able to see the orderings and selections in
+	// the logs.
+	selection := make([]Address, 0, e.config.Candidates+e.config.Endorsers)
 
 	var next *list.Element
-	e.logger.Trace("RoRoRo selectCandidatesAndEndorsers", "agelen", len(e.aged))
-	for cur := e.seniority.Back(); cur != nil; cur = next {
+	e.logger.Trace("RoRoRo selectCandEs", "agelen", len(e.aged))
 
-		next = cur.Prev() // so we can remove, and yes, we are going 'backwards' for now
+	// The permutation is limited to active endorser candidate positions. We
+	// will select e.config.Candidates as active entries before we consider the
+	// remaining active entries as endorsers.
+	pendingEndorserPositions := map[int]bool{}
+
+	// Get a random permutation of ALL active identities eligible as endorsers,
+	// then take the first e.config.Endorsers in that permutation. This gives
+	// us a random selection of endorsers with replacement.
+	nActive := e.activeSelection.Len()
+	if uint64(nActive) < e.config.Candidates+e.config.EndorsersQuorum {
+		return nil, nil, fmt.Errorf(
+			"%v < %v(c) +%v(q):%w", nActive, e.config.Candidates, e.config.EndorsersQuorum, errInsuficientActiveIdents)
+	}
+	permutation := rand.Perm(nActive - int(e.config.Candidates))
+	ne := e.config.Endorsers
+	if uint64(len(permutation)) < ne {
+		ne = uint64(len(permutation))
+	}
+	permutation = permutation[:ne]
+	for _, r := range permutation {
+		pendingEndorserPositions[r] = true
+	}
+
+	endorserPosition := 0
+	for cur := e.activeSelection.Back(); cur != nil; cur = next {
+
+		next = cur.Prev() // so we can remove, and yes, we are going 'backwards'
 
 		age := cur.Value.(*idActivity)
+
 		if !e.withinActivityHorizon(age.endorsedBlock) {
-			e.logger.Trace("RoRoRo selectOldestActive - moving to idle set",
-				"gi", age.genesisOrder, "end", age.endorsedBlock, "last", e.lastBlockNumberSeen)
+			e.logger.Trace("RoRoRo selectCandEs - moving to idle set",
+				"gi", age.genesisOrder, "end", age.endorsedBlock, "last", e.activeBlockFence)
 			continue
 		}
 
-		// XXX: A node is a canidate OR an endorser but not both. The paper isn't
-		// particularly clear on this point but for small networks where Nc is
-		// close to Ne, I can't see how it can be robust otherwise.
+		addr := age.nodeID.Address()
 
-		if len(candidates) >= int(e.config.Candidates) {
-			// Have enough leader candidates, now we are only concerned with
-			// endorsers.
-			endsort = append(endsort, common.Address(age.nodeID.Address()))
-			endorder[endsort[len(endsort)-1]] = age.genesisOrder
-			// e.logger.Trace("RoRoRo selectOldestActive - select", "end", age.nodeID.Address().Hex())
+		// We are accumulating candidates and endorsers together. We stop once
+		// we have enough of *both* (or at the end of the list)
+
+		if uint64(len(candidates)) < e.config.Candidates {
+
+			// A candidate that is oldest for Nc rounds is moved to the idle pool
+			if len(candidates) == 1 {
+				age.oldestFor++
+			}
+			// TODO: Complete the guard against unresponsive nodes, can't until
+			// we sort out the relationship between blocks and rounds
+			if age.oldestFor > int(e.config.Candidates) {
+				// Our chain will just stop progressing if Nc == 1, and that is ok
+				// for now.
+				e.logger.Info("RoRoRo selectCandEs - unresponsive node (droping tbd)",
+					"nodeid", age.nodeID.Address().Hex(), "oldestFor", age.oldestFor)
+			}
+
+			selection = append(selection, addr) // telemetry only
+			candidates[common.Address(addr)] = true
+
+			e.logger.Debug("RoRoRo selectCandEs - select", "cand", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock))
 			continue
+			// Note: divergence (1) leader candidates can not be endorsers
 		}
 
-		// when we see a block from this node.
-		age.oldestFor++
+		endorserPosition++ // endorserPosition advances for all active endorsers
 
-		// TODO: Complete the guard against unresponsive nodes
-		if age.oldestFor > int(e.config.Candidates) {
-			// Our chain will just stop progressing if Nc == 1, and that is ok
-			// for now.
-			e.logger.Info("RoRoRo selectCandidatesAndEndorsers - unresponsive node (droping tbd)",
-				"nodeid", age.nodeID.Address().Hex(), "oldestFor", age.oldestFor)
+		// XXX: age < Te (created less than Te rounds) grinding attack mitigation
+
+		// divergence (2) instead of sorting the endorser candidates by address
+		// (public key) we rely on all nodes seeing the same 'age ordering',
+		// and select them by randomly chosen position in that ordering.
+		if pendingEndorserPositions[endorserPosition] {
+
+			e.logger.Debug("RoRoRo selectCandEs - select", "endo", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock), "p", endorserPosition)
+			endorsers[common.Address(addr)] = true
+			selection = append(selection, addr) // telemetry only
+			delete(pendingEndorserPositions, endorserPosition)
+			if len(pendingEndorserPositions) == 0 {
+				e.logger.Trace("RoRoRo selectCandEs - early out", "n", e.activeSelection.Len(), "e", len(candidates)+endorserPosition)
+				break // early out
+			}
 		}
-
-		// e.logger.Trace("RoRoRo selectOldestActive - select", "can", age.nodeID.Address().Hex())
-		candidates[common.Address(age.nodeID.Address())] = true
-		canorder = append(canorder, strconv.Itoa(age.genesisOrder))
 	}
 
-	endorsers := make(map[common.Address]bool)
-	sort.Sort(ByAddress{endsort})
-	var permutation []string // telemetry
-	for _, i := range rand.Perm(int(e.config.Endorsers)) {
-		endorsers[endsort[i]] = true
-		permutation = append(permutation, strconv.Itoa(i))
-	}
-	e.logger.Info("RoRoRo selectOldestActive - permutation", "p", strings.Join(permutation, ", "))
+	if true {
+		// dump a report of the selection. Can later make this configurable. By
+		// reporting as "block.order", we can, for small development networks,
+		// easily correlate with the network. We probably also want the full
+		// list of nodeID's for larger scale testing.
+		strcans := []string{}
+		strends := []string{}
 
-	if true { // XXX: lets add a selection debug flag on cli
-		endstr := make([]string, 0, len(endorsers))
-		for eaddr := range endorsers {
-			endstr = append(endstr, strconv.Itoa(endorder[eaddr]))
-			// endstr = append(endstr, eaddr.Hex())
+		for _, addr := range selection {
+
+			if addr == zeroAddr {
+				e.logger.Info("RoRoRo RoRoRo selectCandEs - no endorsers, to few candidates",
+					"len", len(selection), "nc", e.config.Candidates, "ne", e.config.Endorsers)
+				break // fewer than desired candidates
+			}
+			// it is a programming error if we get nil here, either for the map entry or for the type assertion
+			el := e.aged[addr]
+			if el == nil {
+				e.logger.Crit("no entry for", "addr", addr.Hex())
+			}
+			age := el.Value.(*idActivity)
+			if age == nil {
+				e.logger.Crit("element with no value", "addr", addr.Hex())
+			}
+
+			s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, fmtAddrex(addr, 3, 1))
+			if candidates[common.Address(addr)] {
+				strcans = append(strcans, s)
+			} else {
+				strends = append(strends, s)
+			}
 		}
-		cstr := strings.Join(canorder, ", ")
-		estr := strings.Join(endstr, ", ")
-		e.logger.Info("RoRoRo selection", "r", header.Number, "cans", cstr, "ends", estr)
+		e.logger.Info("RoRoRo selectCandEs selected", "cans", strings.Join(strcans, ","))
+		e.logger.Info("RoRoRo selectCandEs selected", "ends", strings.Join(strends, ","))
 	}
+
+	e.logger.Info("RoRoRo selectCandEs - iendorsers", "p", permutation, "r", header.Number, "s", e.roundSeed)
 
 	return candidates, endorsers, nil
 }

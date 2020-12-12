@@ -159,28 +159,35 @@ type engine struct {
 	intentMsgHash Hash // we remember the most recent intent hash, even if the intent is cleared, to help with telemetry
 	intent        *pendingIntent
 
-	// seniority  is maintained in identity age order - with the youngest at
+	// activeSelection  is maintained in identity age order - with the youngest at
 	// the front.
-	seniority *list.List             // list of *idActive
-	aged      map[Hash]*list.Element // map of NodeID -> Element in active
+	activeSelection *list.List                // list of *idActive
+	aged            map[Address]*list.Element // map of NodeID.Addresss() -> Element in active
+
+	// The idle pool tracks identities that have gone idle within Ta*2-1 blocks
+	// from head at the time the node started. The *2-1 comes from the
+	// posibilty of seeing enrolments from nodes after their last
+	// (re-)enrolment has gone behond Ta of HEAD. Additionaly, because
+	// selectActive processes the chain from HEAD -> genesis, we can encounter
+	// endorsments before we see the enrolment. To accomodate this we put 'new'
+	// identity activity into the idlePool. Then IF we encounter the enrolment
+	// within Ta of HEAD we move it to the activeSelection
+	idlePool map[Address]*idActivity
 
 	// When updating activity, we walk back from the block we are presented
-	// with. We ERROR if we reach a block number lower than lastBlockNumberSeen
+	// with. We ERROR if we reach a block number lower than activeBlockFence
 	// without matching the hash - that is a branch and we haven't implemented
 	// SelectBranch yet.
-	lastBlockSeen       Hash
-	lastBlockNumberSeen *big.Int
-
-	// idle are the set of identities that have not been active in the last Ta
-	// block rounds. It is not maintained in any particular order.
-	idle *list.List
+	lastBlockSeen    Hash
+	activeBlockFence *big.Int
 
 	// These get updated each round on all nodes without regard to which are
 	// leaders/endorsers or participants.
 	candidates map[common.Address]bool
 	endorsers  map[common.Address]bool
 	// Number of endorsers required to confirm an intent.
-	quorum int
+	quorum    int
+	roundSeed int64 // stored for telemetry purposes, set only in nextRound
 }
 
 func (e *engine) HexNodeID() string {
@@ -215,9 +222,10 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 		roundNumberMu: sync.RWMutex{},
 		roundNumber:   big.NewInt(0),
 
-		aged:                make(map[Hash]*list.Element),
-		lastBlockSeen:       Hash{},
-		lastBlockNumberSeen: nil,
+		aged:             make(map[Address]*list.Element),
+		idlePool:         make(map[Address]*idActivity),
+		lastBlockSeen:    Hash{},
+		activeBlockFence: nil,
 	}
 	e.roundNumberC = sync.NewCond(&e.roundNumberMu)
 
@@ -399,26 +407,6 @@ func (e *engine) SetBroadcaster(broadcaster consensus.Broadcaster) {
 	e.broadcaster = broadcaster
 }
 
-func (e *engine) stop() {
-
-	if e.chainHeadSub != nil { // we are called from Start
-		e.chainHeadSub.Unsubscribe()
-	}
-
-	e.runningMu.Lock()
-	if e.runningCh != nil {
-
-		close(e.runningCh)
-		e.runningCh = nil
-		e.runningMu.Unlock()
-
-		e.runningWG.Wait()
-
-	} else {
-		e.runningMu.Unlock()
-	}
-}
-
 // NotifyRoundChange send val to the notify channel when the round number
 // changes (it does not care if it increases or decreases, only that it
 // changes)
@@ -440,20 +428,24 @@ func (e *engine) RoundNumber() *big.Int {
 
 func (e *engine) Start(
 	reader consensus.ChainReader) error {
-	e.stop()
+
 	e.logger.Info("RoRoRo Start")
+	e.runningMu.Lock()
+	defer e.runningMu.Unlock()
+	if e.runningCh != nil {
+		return nil
+	}
 
 	chain, ok := reader.(RoRoRoChainReader)
 	if !ok {
 		return errIncompatibleChainReader
 	}
 
-	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
-
 	if err := e.primeActivitySelection(chain); err != nil {
 		return err
 	}
 
+	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
 	e.runningCh = make(chan interface{})
 	go e.run(chain, e.runningCh)
 
@@ -461,7 +453,25 @@ func (e *engine) Start(
 }
 
 func (e *engine) Stop() error {
-	e.stop()
+
+	e.logger.Info("RoRoRo stopping")
+
+	if e.chainHeadSub != nil { // we are called from Start
+		e.chainHeadSub.Unsubscribe()
+	}
+
+	e.runningMu.Lock()
+	if e.runningCh != nil {
+
+		close(e.runningCh)
+		e.runningCh = nil
+		e.runningMu.Unlock()
+
+		e.runningWG.Wait()
+
+	} else {
+		e.runningMu.Unlock()
+	}
 	return nil
 }
 
@@ -608,7 +618,11 @@ func (e *engine) FinalizeAndAssemble(
 // than one result may also be returned depending on the consensus algorithm.
 func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	hash := sealHash(block.Header())
+
 	e.logger.Info("RoRoRo Seal", "bn", block.Number(), "#s", hex.EncodeToString(hash[:]))
+	if !e.IsRunning() {
+		return fmt.Errorf("RoRoRo Seal: %w", errEngineStopped)
+	}
 
 	// Without this check we mine blocks constantly, which may be what we want
 	// ... yet with it we stall. not sure why yet
