@@ -256,7 +256,7 @@ func quorumValidateConsensus(ethereum *eth.Ethereum, isRaft bool) {
 	if !isRaft &&
 		ethereum.BlockChain().Config().Istanbul == nil &&
 		ethereum.BlockChain().Config().Clique == nil &&
-		ethereum.BlockChain().Config().RoRoRo == nil {
+		ethereum.BlockChain().Config().RRR == nil {
 		utils.Fatalf("Consensus not specified. Exiting!!")
 	}
 }

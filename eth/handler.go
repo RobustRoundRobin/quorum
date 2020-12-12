@@ -928,8 +928,8 @@ func (pm *ProtocolManager) getConsensusAlgorithm() string {
 			consensusAlgo = "clique"
 		case *ethash.Ethash:
 			consensusAlgo = "ethash"
-		case consensus.RoRoRo:
-			consensusAlgo = "RoRoRo"
+		case consensus.RRR:
+			consensusAlgo = "RRR"
 		default:
 			consensusAlgo = "unknown"
 		}

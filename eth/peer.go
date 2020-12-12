@@ -370,7 +370,7 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 		status      statusData   // safe to read after two values have been received from errc
 		istanbulOld = protocolName == "istanbul" && p.version == consensus.Istanbul64
 		istanbulNew = protocolName == "istanbul" && p.version == consensus.Istanbul99
-		rororo      = protocolName == "RoRoRo" && p.version == consensus.RoRoRo112
+		rrr      = protocolName == "RRR" && p.version == consensus.RRR112
 	)
 	go func() {
 		switch {
@@ -382,7 +382,7 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 				CurrentBlock:    head,
 				GenesisBlock:    genesis,
 			})
-		case p.version == eth64 || istanbulNew || rororo:
+		case p.version == eth64 || istanbulNew || rrr:
 			errc <- p2p.Send(p.rw, StatusMsg, &statusData{
 				ProtocolVersion: uint32(p.version),
 				NetworkID:       network,
@@ -399,7 +399,7 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 		switch {
 		case p.version == eth63 || istanbulOld:
 			errc <- p.readStatusLegacy(network, &status63, genesis)
-		case p.version == eth64 || istanbulNew || rororo:
+		case p.version == eth64 || istanbulNew || rrr:
 			errc <- p.readStatus(network, &status, genesis, forkFilter)
 		default:
 			panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))
@@ -420,7 +420,7 @@ func (p *peer) Handshake(network uint64, td *big.Int, head common.Hash, genesis 
 	switch {
 	case p.version == eth63 || istanbulOld:
 		p.td, p.head = status63.TD, status63.CurrentBlock
-	case p.version == eth64 || istanbulNew || rororo:
+	case p.version == eth64 || istanbulNew || rrr:
 		p.td, p.head = status.TD, status.Head
 	default:
 		panic(fmt.Sprintf("unsupported eth protocol version: %d", p.version))

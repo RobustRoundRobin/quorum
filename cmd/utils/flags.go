@@ -874,31 +874,31 @@ var (
 		Usage: "Default minimum difference between two consecutive block's timestamps in seconds",
 		Value: eth.DefaultConfig.Istanbul.BlockPeriod,
 	}
-	// RoRoRo settings
-	RoRoRoConfirmTimeoutFlag = cli.Uint64Flag{
-		Name:  "rororo.confirmtimeout",
+	// RRR settings
+	RRRConfirmPhaseFlag = cli.Uint64Flag{
+		Name:  "rrr.confirmphase",
 		Usage: "leader candidates wait this long (milliseconds) for the required confirmations before giving up",
-		Value: eth.DefaultConfig.RoRoRo.ConfirmTimeout,
+		Value: eth.DefaultConfig.RRR.ConfirmPhase,
 	}
-	RoRoRoRoundLengthFlag = cli.Uint64Flag{
-		Name:  "rororo.roundlength",
+	RRRRoundLengthFlag = cli.Uint64Flag{
+		Name:  "rrr.roundlength",
 		Usage: "each consensus round is losely syncrhonised to this duration (milliseconds)",
-		Value: eth.DefaultConfig.RoRoRo.RoundLength,
+		Value: eth.DefaultConfig.RRR.RoundLength,
 	}
-	RoRoRoCandidatesFlag = cli.Uint64Flag{
-		Name:  "rororo.candidates",
+	RRRCandidatesFlag = cli.Uint64Flag{
+		Name:  "rrr.nc",
 		Usage: "Number of leader candidates for each round",
-		Value: eth.DefaultConfig.RoRoRo.Candidates,
+		Value: eth.DefaultConfig.RRR.Candidates,
 	}
-	RoRoRoEndorsersFlag = cli.Uint64Flag{
-		Name:  "rororo.endorsers",
+	RRREndorsersFlag = cli.Uint64Flag{
+		Name:  "rrr.ne",
 		Usage: "Number of endorsers to use for each leadership round",
-		Value: eth.DefaultConfig.RoRoRo.Endorsers,
+		Value: eth.DefaultConfig.RRR.Endorsers,
 	}
-	RoRoRoEndorsersQuorumFlag = cli.Uint64Flag{
-		Name:  "rororo.endorsersquorum",
+	RRRQuorumFlag = cli.Uint64Flag{
+		Name:  "rrr.q",
 		Usage: "Number of endorsers required to confirm a leaders intent",
-		Value: eth.DefaultConfig.RoRoRo.EndorsersQuorum,
+		Value: eth.DefaultConfig.RRR.Quorum,
 	}
 )
 
@@ -1576,23 +1576,23 @@ func setRaft(ctx *cli.Context, cfg *eth.Config) {
 	cfg.RaftMode = ctx.GlobalBool(RaftModeFlag.Name)
 }
 
-func setRoRoRo(ctx *cli.Context, cfg *eth.Config) {
+func setRRR(ctx *cli.Context, cfg *eth.Config) {
 
-	if ctx.GlobalIsSet(RoRoRoConfirmTimeoutFlag.Name) {
-		cfg.RoRoRo.ConfirmTimeout = ctx.GlobalUint64(RoRoRoConfirmTimeoutFlag.Name)
+	if ctx.GlobalIsSet(RRRConfirmPhaseFlag.Name) {
+		cfg.RRR.ConfirmPhase = ctx.GlobalUint64(RRRConfirmPhaseFlag.Name)
 	}
-	if ctx.GlobalIsSet(RoRoRoRoundLengthFlag.Name) {
-		cfg.RoRoRo.RoundLength = ctx.GlobalUint64(RoRoRoRoundLengthFlag.Name)
+	if ctx.GlobalIsSet(RRRRoundLengthFlag.Name) {
+		cfg.RRR.RoundLength = ctx.GlobalUint64(RRRRoundLengthFlag.Name)
 	}
 
-	if ctx.GlobalIsSet(RoRoRoCandidatesFlag.Name) {
-		cfg.RoRoRo.Candidates = ctx.GlobalUint64(RoRoRoCandidatesFlag.Name)
+	if ctx.GlobalIsSet(RRRCandidatesFlag.Name) {
+		cfg.RRR.Candidates = ctx.GlobalUint64(RRRCandidatesFlag.Name)
 	}
-	if ctx.GlobalIsSet(RoRoRoEndorsersFlag.Name) {
-		cfg.RoRoRo.Endorsers = ctx.GlobalUint64(RoRoRoEndorsersFlag.Name)
+	if ctx.GlobalIsSet(RRREndorsersFlag.Name) {
+		cfg.RRR.Endorsers = ctx.GlobalUint64(RRREndorsersFlag.Name)
 	}
-	if ctx.GlobalIsSet(RoRoRoEndorsersQuorumFlag.Name) {
-		cfg.RoRoRo.EndorsersQuorum = ctx.GlobalUint64(RoRoRoEndorsersQuorumFlag.Name)
+	if ctx.GlobalIsSet(RRRQuorumFlag.Name) {
+		cfg.RRR.Quorum = ctx.GlobalUint64(RRRQuorumFlag.Name)
 	}
 
 }
@@ -1602,7 +1602,7 @@ func setQuorumConfig(ctx *cli.Context, cfg *eth.Config) {
 
 	setIstanbul(ctx, cfg)
 	setRaft(ctx, cfg)
-	setRoRoRo(ctx, cfg)
+	setRRR(ctx, cfg)
 }
 
 // CheckExclusive verifies that only a single instance of the provided flags was

@@ -306,7 +306,7 @@ type ChainConfig struct {
 	Ethash   *EthashConfig   `json:"ethash,omitempty"`
 	Clique   *CliqueConfig   `json:"clique,omitempty"`
 	Istanbul *IstanbulConfig `json:"istanbul,omitempty"`
-	RoRoRo   *RoRoRoConfig   `json:"rororo,omitempty"`
+	RRR   *RRRConfig   `json:"rrr,omitempty"`
 
 	IsQuorum             bool   `json:"isQuorum"`     // Quorum flag
 	TransactionSizeLimit uint64 `json:"txnSizeLimit"` // Quorum - transaction size limit
@@ -355,12 +355,12 @@ func (c *IstanbulConfig) String() string {
 	return "istanbul"
 }
 
-// RoRoRoConfig is the consensus engine config for RoRoRo based sealing
-type RoRoRoConfig struct {
+// RRRConfig is the consensus engine config for RRR based sealing
+type RRRConfig struct {
 }
 
-func (c *RoRoRoConfig) String() string {
-	return "rororo" // xxx: capitolize ? not sure, would like to avoid case sensitivity issues
+func (c *RRRConfig) String() string {
+	return "rrr" // xxx: capitolize ? not sure, would like to avoid case sensitivity issues
 }
 
 // String implements the fmt.Stringer interface.
@@ -373,8 +373,8 @@ func (c *ChainConfig) String() string {
 		engine = c.Clique
 	case c.Istanbul != nil:
 		engine = c.Istanbul
-	case c.RoRoRo != nil:
-		engine = c.RoRoRo
+	case c.RRR != nil:
+		engine = c.RRR
 	default:
 		engine = "unknown"
 	}

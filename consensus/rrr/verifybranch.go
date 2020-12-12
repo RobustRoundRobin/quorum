@@ -1,4 +1,4 @@
-package rororo
+package rrr
 
 import (
 	"encoding/hex"
@@ -37,7 +37,7 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 
 		h0 := Hash{}
 		if e.genesisEx.ChainID == h0 {
-			e.logger.Info("RoRoRo VerifyBranchHeaders - genesis block", "extra", hex.EncodeToString(header.Extra))
+			e.logger.Info("RRR VerifyBranchHeaders - genesis block", "extra", hex.EncodeToString(header.Extra))
 			err := rlp.DecodeBytes(header.Extra, &e.genesisEx)
 			if err != nil {
 				return err
@@ -72,8 +72,8 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	// so the block number for the local (never to be commited) work will be
 	// equal to the block number from the leader
 	if parentSE.Intent.RoundNumber.Cmp(se.Intent.RoundNumber) >= 0 {
-		e.logger.Info("RoRoRo new block round number lower than current parent", "parent", parentSE.Intent.RoundNumber, "new", se.Intent.RoundNumber)
-		// return fmt.Errorf("rororo round number to young: %v > %v", parentSE.Intent.RoundNumber, se.Intent.RoundNumber)
+		e.logger.Info("RRR new block round number lower than current parent", "parent", parentSE.Intent.RoundNumber, "new", se.Intent.RoundNumber)
+		// return fmt.Errorf("rrr round number to young: %v > %v", parentSE.Intent.RoundNumber, se.Intent.RoundNumber)
 	}
 
 	return nil
@@ -82,7 +82,7 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header) (*SignedExtraData, error) {
 
 	if header.Number.Cmp(big0) == 0 {
-		return nil, fmt.Errorf("RoRoRo the genesis header cannot be verified by this method")
+		return nil, fmt.Errorf("RRR the genesis header cannot be verified by this method")
 	}
 
 	// Check the seal (extraData) format is correct and signed
@@ -94,12 +94,12 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	// header
 	if se.Intent.ChainID != e.genesisEx.ChainID {
 		return se, fmt.Errorf(
-			"rororo sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
+			"rrr sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
 	}
 
 	// Ensure that the coinbase is valid
 	if header.Nonce != emptyNonce {
-		return se, fmt.Errorf("rororo nonce must be empty")
+		return se, fmt.Errorf("rrr nonce must be empty")
 	}
 
 	// mix digest - we don't assert anything about that
@@ -108,14 +108,14 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 
 	// Check that the NodeID in the intent matches the sealer
 	if sealerID != se.Intent.NodeID {
-		return se, fmt.Errorf("rororo sealer node id mismatch: sealer=`%s' node=`%s'",
+		return se, fmt.Errorf("rrr sealer node id mismatch: sealer=`%s' node=`%s'",
 			sealerID.Hex(), se.Intent.NodeID.Hex())
 	}
 
 	// Check that the sealed parent hash from the intent matches the parent
 	// hash on the header.
 	if common.Hash(se.Intent.ParentHash) != header.ParentHash {
-		return se, fmt.Errorf("rororo parent mismatch: sealed=`%s' header=`%s'",
+		return se, fmt.Errorf("rrr parent mismatch: sealed=`%s' header=`%s'",
 			hex.EncodeToString(se.Intent.ParentHash[:]),
 			hex.EncodeToString(header.ParentHash[:]))
 	}
@@ -123,7 +123,7 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	// Check that the sealed tx root from the intent matches the tx root in the
 	// header.
 	if common.Hash(se.Intent.TxHash) != header.TxHash {
-		return se, fmt.Errorf("rororo txhash mismatch: sealed=`%s' header=`%s'",
+		return se, fmt.Errorf("rrr txhash mismatch: sealed=`%s' header=`%s'",
 			hex.EncodeToString(se.Intent.TxHash[:]),
 			hex.EncodeToString(header.TxHash[:]))
 	}
@@ -138,13 +138,13 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	for _, end := range se.Confirm {
 		// Check the endorsers ChainID
 		if end.ChainID != e.genesisEx.ChainID {
-			return se, fmt.Errorf("rororo endorsment chainid invalid: `%s'", end.IntentHash.Hex())
+			return se, fmt.Errorf("rrr endorsment chainid invalid: `%s'", end.IntentHash.Hex())
 		}
 
 		// Check that the intent hash signed by the endorser matches the intent
 		// sealed in the block header by the leader
 		if end.IntentHash != intentHash {
-			return se, fmt.Errorf("rororo endorsment intent hash mismatch: sealed=`%s' endorsed=`%s'",
+			return se, fmt.Errorf("rrr endorsment intent hash mismatch: sealed=`%s' endorsed=`%s'",
 				intentHash.Hex(), end.IntentHash.Hex())
 		}
 	}
@@ -202,10 +202,10 @@ func (e *engine) decodeHeaderSeal(header *types.Header) (*SignedExtraData, Hash,
 		return nil, Hash{}, nil, fmt.Errorf("the genesis block is not compatible with decodeHeaderSeal")
 	}
 
-	if len(header.Extra) < RoRoRoExtraVanity {
-		return nil, Hash{}, nil, fmt.Errorf("RoRoRo missing extra data on block header")
+	if len(header.Extra) < RRRExtraVanity {
+		return nil, Hash{}, nil, fmt.Errorf("RRR missing extra data on block header")
 	}
-	seal := header.Extra[RoRoRoExtraVanity:]
+	seal := header.Extra[RRRExtraVanity:]
 
 	se := &SignedExtraData{}
 

@@ -1,4 +1,4 @@
-package rororo
+package rrr
 
 import (
 	"crypto/ecdsa"
@@ -23,7 +23,7 @@ type GenesisExtraData struct {
 // IdentInit creates, or extends, the identity initialisation vector for the
 // extraData in the genesis block. init is nil or the currently included
 // identities. One or more nodeids are passed as the trailing parameters. The
-// updated init vector is returned. See EIP-rororo/extraData of Block0
+// updated init vector is returned. See EIP-rrr/extraData of Block0
 func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrolment, error) {
 
 	start := len(init)
@@ -61,7 +61,7 @@ func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrol
 }
 
 // Populate fills in a ChainInit ready for encoding in the genesis extraData
-// See EIP-rororo/extraData of Block0/9.
+// See EIP-rrr/extraData of Block0/9.
 func (ci *ChainInit) Populate(ck *ecdsa.PrivateKey, initIdents []Enrolment, seed []byte) error {
 
 	ci.IdentInit = make([]Enrolment, len(initIdents))

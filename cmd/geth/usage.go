@@ -309,10 +309,11 @@ var AppHelpFlagGroups = []flagGroup{
 	{
 		Name: "RORORO",
 		Flags: []cli.Flag{
-			utils.RoRoRoConfirmTimeoutFlag,
-			utils.RoRoRoRoundLengthFlag,
-			utils.RoRoRoCandidatesFlag,
-			utils.RoRoRoEndorsersFlag,
+			utils.RRRConfirmPhaseFlag,
+			utils.RRRRoundLengthFlag,
+			utils.RRRCandidatesFlag,
+			utils.RRREndorsersFlag,
+			utils.RRRQuorumFlag,
 		},
 	},
 	// END QUORUM

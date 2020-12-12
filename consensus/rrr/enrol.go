@@ -1,4 +1,4 @@
-package rororo
+package rrr
 
 // All hashes are keccak 256 unless otherwise stated
 
@@ -63,7 +63,7 @@ func (q *Quote) EnrolIdentity(
 // EnrolmentBinding is rlp encoded, hashed and signed to introduce NodeID as a
 // member.
 type EnrolmentBinding struct {
-	ChainID   Hash     // ChainID is EIP-rororo/extraData of Block0
+	ChainID   Hash     // ChainID is EIP-rrr/extraData of Block0
 	NodeID    Hash     // NodeID is defined by ethereum as keccak 256 ( PublicKey X || Y )
 	Round     *big.Int // Round is the consensus round
 	BlockHash Hash     // BlockHash is the block hash for the head of the selected chain branch

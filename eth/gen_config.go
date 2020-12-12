@@ -9,7 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
-	"github.com/ethereum/go-ethereum/consensus/rororo"
+	"github.com/ethereum/go-ethereum/consensus/rrr"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -48,7 +48,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		RaftMode                bool
 		EnableNodePermission    bool
 		Istanbul                istanbul.Config
-		RoRoRo                  rororo.Config
+		RRR                  rrr.Config
 		DocRoot                 string `toml:"-"`
 		EWASMInterpreter        string
 		EVMInterpreter          string
@@ -86,7 +86,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.RaftMode = c.RaftMode
 	enc.EnableNodePermission = c.EnableNodePermission
 	enc.Istanbul = c.Istanbul
-	enc.RoRoRo = c.RoRoRo
+	enc.RRR = c.RRR
 	enc.DocRoot = c.DocRoot
 	enc.EWASMInterpreter = c.EWASMInterpreter
 	enc.EVMInterpreter = c.EVMInterpreter
@@ -128,7 +128,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		RaftMode                *bool
 		EnableNodePermission    *bool
 		Istanbul                *istanbul.Config
-		RoRoRo                  *rororo.Config
+		RRR                  *rrr.Config
 		DocRoot                 *string `toml:"-"`
 		EWASMInterpreter        *string
 		EVMInterpreter          *string
@@ -225,8 +225,8 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.Istanbul != nil {
 		c.Istanbul = *dec.Istanbul
 	}
-	if dec.RoRoRo != nil {
-		c.RoRoRo = *dec.RoRoRo
+	if dec.RRR != nil {
+		c.RRR = *dec.RRR
 	}
 	if dec.DocRoot != nil {
 		c.DocRoot = *dec.DocRoot

@@ -214,7 +214,7 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 	switch engine.(type) {
 	case consensus.Istanbul:
 		ok = true
-	case consensus.RoRoRo:
+	case consensus.RRR:
 		ok = true
 	}
 
@@ -288,7 +288,7 @@ func (w *worker) start() {
 	switch e := w.engine.(type) {
 	case consensus.Istanbul:
 		e.Start(w.chain, w.chain.CurrentBlock, w.chain.HasBadBlock)
-	case consensus.RoRoRo:
+	case consensus.RRR:
 		e.Start(w.chain)
 	}
 
@@ -300,7 +300,7 @@ func (w *worker) stop() {
 	switch e := w.engine.(type) {
 	case consensus.Istanbul:
 		e.Stop()
-	case consensus.RoRoRo:
+	case consensus.RRR:
 		e.Stop()
 	}
 	atomic.StoreInt32(&w.running, 0)

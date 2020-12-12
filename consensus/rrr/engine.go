@@ -1,4 +1,4 @@
-package rororo
+package rrr
 
 import (
 	"bytes"
@@ -33,7 +33,7 @@ var (
 	errEndorsersNotQuorate     = errors.New("insufficient endorsers online")
 	errP2PMsgInvalidCode       = errors.New("recieved p2p.Msg with unsported code")
 	errRMsgInvalidCode         = errors.New("recevived RMsg with invalid code")
-	errIncompatibleChainReader = errors.New("chainreader missing required interfaces for RoRoRo")
+	errIncompatibleChainReader = errors.New("chainreader missing required interfaces for RRR")
 	errEngineStopped           = errors.New("consensus not running")
 	errNotEndorser             = errors.New("expected to be endorser")
 	errNotLeaderCandidate      = errors.New("expected to be leader candidate")
@@ -58,17 +58,17 @@ var (
 const (
 	NewBlockMsg = 0x07
 
-	RoRoRoExtraVanity = 32
-	rororoMsg         = 0x11
+	RRRExtraVanity = 32
+	rrrMsg         = 0x11
 
 	// TODO: probably want this to be driven by Nc, Ne configuration
 	lruPeers    = 100 + 6*2
 	lruMessages = 1024
 )
 
-// RMsgCode identifies the rororo message type. rororoMsg identifies rororo's
+// RMsgCode identifies the rrr message type. rrrMsg identifies rrr's
 // message type to the devp2p layer as being consensus engine specific. Once
-// that outer message is delivered to rororo, RMsgCode is how rororo
+// that outer message is delivered to rrr, RMsgCode is how rrr
 // differentiates each of its supported message payloads.
 type RMsgCode uint
 
@@ -89,7 +89,7 @@ type RMsg struct {
 // API is a user facing RPC API to dump Istanbul state
 type API struct {
 	chain  consensus.ChainReader
-	rororo *engine
+	rrr *engine
 }
 
 type ChainSubscriber interface {
@@ -98,10 +98,10 @@ type ChainSubscriber interface {
 	SubscribeChainSideEvent(ch chan<- core.ChainSideEvent) event.Subscription
 }
 
-// RoRoRoChainReader the implementation of ChainReader passed to Start must
-// implement the RoRoRoChainReader interface. This is a run time check to avoid
+// RRRChainReader the implementation of ChainReader passed to Start must
+// implement the RRRChainReader interface. This is a run time check to avoid
 // import cycles on the core event types
-type RoRoRoChainReader interface {
+type RRRChainReader interface {
 	consensus.ChainReader
 	ChainSubscriber
 	CurrentBlock() *types.Block
@@ -200,8 +200,8 @@ func (e *engine) IsRunning() bool {
 	return e.runningCh != nil
 }
 
-// New create rororo consensus engine
-func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consensus.RoRoRo {
+// New create rrr consensus engine
+func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consensus.RRR {
 
 	logger := log.New()
 	// Only get err from NewRC if zize requested is <=0
@@ -242,7 +242,7 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 
 	var err error
 
-	if data.Code != rororoMsg {
+	if data.Code != rrrMsg {
 		return false, nil
 	}
 
@@ -261,13 +261,13 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 		return true, err
 	}
 
-	e.logger.Trace("RoRoRo HandleMsg", "#msg", msgHash.Hex(), "#raw", Keccak256Hash(rmsg.Raw).Hex())
+	e.logger.Trace("RRR HandleMsg", "#msg", msgHash.Hex(), "#raw", Keccak256Hash(rmsg.Raw).Hex())
 
 	// Note: it is the msgHash we want here, not the raw hash. We want it to be
 	// possible for leader candidates to request a re-evaluation of the same
 	// block proposal. Otherwise they can get stuck in small network scenarios.
 	if seen := e.updateInboundMsgTracking(peerAddr, msgHash); seen {
-		e.logger.Trace("RoRoRo HandleMsg - ignoring previously seen")
+		e.logger.Trace("RRR HandleMsg - ignoring previously seen")
 		return true, nil
 	}
 
@@ -277,11 +277,11 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 		si := &engSignedIntent{ReceivedAt: data.ReceivedAt, Seq: rmsg.Seq}
 
 		if si.Pub, err = si.DecodeSigned(NewBytesStream([]byte(rmsg.Raw))); err != nil {
-			e.logger.Info("RoRoRo Intent decodeverify failed", "err", err)
+			e.logger.Info("RRR Intent decodeverify failed", "err", err)
 			return true, err
 		}
 
-		e.logger.Trace("RoRoRo HandleMsg - post engSignedIntent")
+		e.logger.Trace("RRR HandleMsg - post engSignedIntent")
 		e.runningCh <- si
 
 		return true, nil
@@ -294,11 +294,11 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 		s := rlp.NewStream(r, uint64(len(rmsg.Raw)))
 
 		if sc.Pub, err = sc.DecodeSigned(s); err != nil {
-			e.logger.Info("RoRoRo Endorsement decodeverify failed", "err", err)
+			e.logger.Info("RRR Endorsement decodeverify failed", "err", err)
 			return true, err
 		}
 
-		e.logger.Trace("RoRoRo HandleMsg - post engSignedEndorsement")
+		e.logger.Trace("RRR HandleMsg - post engSignedEndorsement")
 		e.runningCh <- sc
 
 		return true, nil
@@ -311,13 +311,13 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 // Send the message to the peer - if its hash is not in the ARU cache for the
 // peer
 func (e *engine) Send(peerAddr common.Address, msg []byte) error {
-	e.logger.Trace("RoRoRo Send")
+	e.logger.Trace("RRR Send")
 
 	msgHash := Keccak256Hash(msg)
 
 	peers := e.broadcaster.FindPeers(map[common.Address]bool{peerAddr: true})
 	if len(peers) != 1 {
-		return fmt.Errorf("RoRoRo Send - no peer connection")
+		return fmt.Errorf("RRR Send - no peer connection")
 	}
 	peer := peers[peerAddr]
 	if peer == nil {
@@ -335,12 +335,12 @@ func (e *engine) Broadcast(self common.Address, peers map[common.Address]consens
 	for peerAddr, peer := range peers {
 
 		if peerAddr == self {
-			e.logger.Trace("RoRoRo Broadcast - skipping self")
+			e.logger.Trace("RRR Broadcast - skipping self")
 			continue
 		}
 
 		if err := e.peerSend(peer, peerAddr, msg, msgHash); err != nil {
-			e.logger.Info("RoRoRo Broadcast - error sending msg", "err", err, "peer", peerAddr)
+			e.logger.Info("RRR Broadcast - error sending msg", "err", err, "peer", peerAddr)
 		}
 	}
 	return nil
@@ -368,12 +368,12 @@ func (e *engine) peerSend(
 	msgs.Add(msgHash, true)
 	e.peerMessages.Add(peerAddr, msgs)
 
-	e.logger.Trace("RoRoRo peerSend - sending", "hash", msgHash.Hex(), "safe-hash", Keccak256Hash(msg).Hex())
+	e.logger.Trace("RRR peerSend - sending", "hash", msgHash.Hex(), "safe-hash", Keccak256Hash(msg).Hex())
 
 	// Send will error imediately on encoding problems. But otherwise it
 	// will block until the receiver consumes the message or the send times
 	// out. So we can not sensibly collect errors.
-	go peer.Send(rororoMsg, msg)
+	go peer.Send(rrrMsg, msg)
 	return nil
 }
 
@@ -429,14 +429,14 @@ func (e *engine) RoundNumber() *big.Int {
 func (e *engine) Start(
 	reader consensus.ChainReader) error {
 
-	e.logger.Info("RoRoRo Start")
+	e.logger.Info("RRR Start")
 	e.runningMu.Lock()
 	defer e.runningMu.Unlock()
 	if e.runningCh != nil {
 		return nil
 	}
 
-	chain, ok := reader.(RoRoRoChainReader)
+	chain, ok := reader.(RRRChainReader)
 	if !ok {
 		return errIncompatibleChainReader
 	}
@@ -454,7 +454,7 @@ func (e *engine) Start(
 
 func (e *engine) Stop() error {
 
-	e.logger.Info("RoRoRo stopping")
+	e.logger.Info("RRR stopping")
 
 	if e.chainHeadSub != nil { // we are called from Start
 		e.chainHeadSub.Unsubscribe()
@@ -479,7 +479,7 @@ func (e *engine) Stop() error {
 // block, which may be different from the header's coinbase if a consensus
 // engine is based on signatures.
 func (e *engine) Author(header *types.Header) (common.Address, error) {
-	e.logger.Info("RoRoRo Author")
+	e.logger.Info("RRR Author")
 
 	_, sealerID, _, err := e.decodeHeaderSeal(header)
 	if err != nil {
@@ -489,9 +489,9 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 	sealingNodeAddr := common.Address(sealerID.Address())
 
 	if sealingNodeAddr == e.nodeAddr {
-		e.logger.Info("RoRoRo sealed by self", "address", sealingNodeAddr)
+		e.logger.Info("RRR sealed by self", "address", sealingNodeAddr)
 	} else {
-		e.logger.Info("RoRoRo sealed by", "address", sealingNodeAddr)
+		e.logger.Info("RRR sealed by", "address", sealingNodeAddr)
 	}
 	return sealingNodeAddr, nil
 }
@@ -500,7 +500,7 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 // given engine. Verifying the seal may be done optionally here, or explicitly
 // via the VerifySeal method.
 func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header, seal bool) error {
-	e.logger.Info("RoRoRo VerifyHeader")
+	e.logger.Info("RRR VerifyHeader")
 
 	return e.verifyBranchHeaders(chain, header, nil)
 }
@@ -510,7 +510,7 @@ func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header,
 // a results channel to retrieve the async verifications (the order is that of
 // the input slice).
 func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
-	e.logger.Info("RoRoRo VerifyHeaders")
+	e.logger.Info("RRR VerifyHeaders")
 
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
@@ -541,7 +541,7 @@ func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Hea
 // VerifyUncles verifies that the given block's uncles conform to the consensus
 // rules of a given engine.
 func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) error {
-	e.logger.Info("RoRoRo VerifyUncles")
+	e.logger.Info("RRR VerifyUncles")
 
 	if len(block.Uncles()) > 0 {
 		return errInvalidUncleHash
@@ -552,7 +552,7 @@ func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 // VerifySeal checks whether the crypto seal on a header is valid according to
 // the consensus rules of the given engine.
 func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
-	e.logger.Info("RoRoRo VerifySeal")
+	e.logger.Info("RRR VerifySeal")
 
 	if _, err := e.verifyHeader(chain, header); err != nil {
 		return err
@@ -563,13 +563,13 @@ func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) e
 // Prepare initializes the consensus fields of a block header according to the
 // rules of a particular engine. The changes are executed inline.
 func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) error {
-	e.logger.Info("RoRoRo Prepare")
+	e.logger.Info("RRR Prepare")
 
 	// Start witht the default vanity data and nothing else.
-	extra := make([]byte, RoRoRoExtraVanity)
+	extra := make([]byte, RRRExtraVanity)
 	copy(extra, header.Extra)
 	header.Extra = extra
-	// this is just the block number for rororo
+	// this is just the block number for rrr
 	header.Difficulty = header.Number
 
 	return nil
@@ -583,9 +583,9 @@ func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) erro
 func (e *engine) Finalize(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header) {
-	e.logger.Info("RoRoRo Finalize")
+	e.logger.Info("RRR Finalize")
 
-	// No block rewards in rororo, so the state remains as is and uncles are dropped
+	// No block rewards in rrr, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = nilUncleHash
 }
@@ -599,9 +599,9 @@ func (e *engine) FinalizeAndAssemble(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
 
-	e.logger.Info("RoRoRo FinalizeAndAssemble", "#tx", len(txs))
+	e.logger.Info("RRR FinalizeAndAssemble", "#tx", len(txs))
 
-	// No block rewards in rororo, so the state remains as is and uncles are dropped
+	// No block rewards in rrr, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = nilUncleHash
 
@@ -619,9 +619,9 @@ func (e *engine) FinalizeAndAssemble(
 func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	hash := sealHash(block.Header())
 
-	e.logger.Info("RoRoRo Seal", "bn", block.Number(), "#s", hex.EncodeToString(hash[:]))
+	e.logger.Info("RRR Seal", "bn", block.Number(), "#s", hex.EncodeToString(hash[:]))
 	if !e.IsRunning() {
-		return fmt.Errorf("RoRoRo Seal: %w", errEngineStopped)
+		return fmt.Errorf("RRR Seal: %w", errEngineStopped)
 	}
 
 	// Without this check we mine blocks constantly, which may be what we want
@@ -637,7 +637,7 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 			ph.TxHash == h.TxHash &&
 			ph.ReceiptHash == h.ReceiptHash {
 			e.logger.Info(
-				"RoRoRo Seal skip identical block",
+				"RRR Seal skip identical block",
 				"#tx", len(block.Transactions()), "txhash", h.TxHash.Hex(),
 			)
 			results <- nil
@@ -656,14 +656,14 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 }
 
 // SealHash returns the hash of a block prior to it being sealed. This hash
-// excludes the rororo extra data beyond the fixed 32 byte vanity. The various
-// elements in the rororo extra data carry their own signatures over data which
+// excludes the rrr extra data beyond the fixed 32 byte vanity. The various
+// elements in the rrr extra data carry their own signatures over data which
 // bind the elements to the block being sealed. If the extra data on the header
-// is < RoRoRoExtraVanity bytes long this function will panic (to avoid
+// is < RRRExtraVanity bytes long this function will panic (to avoid
 // accidentally creating the same hash for different blocks).
 func (e *engine) SealHash(header *types.Header) common.Hash {
 	h := sealHash(header)
-	e.logger.Info("RoRoRo SealHash", "#", h.Hex())
+	e.logger.Info("RRR SealHash", "#", h.Hex())
 
 	return h
 }
@@ -687,16 +687,16 @@ func sealHash(header *types.Header) common.Hash {
 		header.GasLimit,
 		header.GasUsed,
 		header.Time,
-		header.Extra[:RoRoRoExtraVanity],
+		header.Extra[:RRRExtraVanity],
 	})
 	hasher.Sum(h[:0])
 	return h
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
-// that a new block should have. For rororo this is just the round number
+// that a new block should have. For rrr this is just the round number
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
-	e.logger.Info("RoRoRo CalcDifficulty")
+	e.logger.Info("RRR CalcDifficulty")
 
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
@@ -711,20 +711,20 @@ func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent
 func (e *engine) APIs(chain consensus.ChainReader) []rpc.API {
 	return []rpc.API{}
 	// return []rpc.API{{
-	// 	Namespace: "rororo",
+	// 	Namespace: "rrr",
 	// 	Version:   "1.0",
-	// 	Service:   &API{chain: chain, rororo: e},
+	// 	Service:   &API{chain: chain, rrr: e},
 	// 	Public:    true,
 	// }}
 }
 
 // Protocol returns the protocol for this consensus
 func (e *engine) Protocol() consensus.Protocol {
-	return consensus.RoRoRoProtocol
+	return consensus.RRRProtocol
 }
 
 // Close terminates any background threads maintained by the consensus engine.
 func (e *engine) Close() error {
-	e.logger.Info("RoRoRo Close")
+	e.logger.Info("RRR Close")
 	return nil
 }

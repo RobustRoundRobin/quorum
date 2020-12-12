@@ -34,7 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	istanbulBackend "github.com/ethereum/go-ethereum/consensus/istanbul/backend"
-	"github.com/ethereum/go-ethereum/consensus/rororo"
+	"github.com/ethereum/go-ethereum/consensus/rrr"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/bloombits"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -300,8 +300,8 @@ func CreateConsensusEngine(ctx *node.ServiceContext, chainConfig *params.ChainCo
 		return istanbulBackend.New(&config.Istanbul, ctx.NodeKey(), db)
 	}
 
-	if chainConfig.RoRoRo != nil {
-		return rororo.New(&config.RoRoRo, ctx.NodeKey(), db)
+	if chainConfig.RRR != nil {
+		return rrr.New(&config.RRR, ctx.NodeKey(), db)
 	}
 
 	// Otherwise assume proof-of-work

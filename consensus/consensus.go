@@ -151,10 +151,10 @@ type Istanbul interface {
 	Stop() error
 }
 
-// RoRoRo uses deterministic (round-robin) leadership selection combined with
+// RRR uses deterministic (round-robin) leadership selection combined with
 // an endorsment protocol which provides block creation fairness, good liveness
 // and good efficiency.
-type RoRoRo interface {
+type RRR interface {
 	Engine
 	// Note: type asserts additional interfaces on chain
 	Start(chain ChainReader) error

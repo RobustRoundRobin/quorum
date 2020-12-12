@@ -1,9 +1,9 @@
-package rororo
+package rrr
 
-// The ambition is to have much of rororo implemented in its own package.
+// The ambition is to have much of rrr implemented in its own package.
 // However, some of go-ethereums crypto primitives are far to useful to re-work
 // at this stage. This file exists to keep the dependencies on go-ethereum in
-// one place. Its not clear how this will all turn out.  Possibly a rororo go
+// one place. Its not clear how this will all turn out.  Possibly a rrr go
 // package is useful in order to support both quorum and go-ethereum upstream,
 // possibly that isn't realistic. This small accomodation keeps to door open a
 // crack

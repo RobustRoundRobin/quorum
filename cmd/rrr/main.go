@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/consensus/rororo"
+	"github.com/ethereum/go-ethereum/consensus/rrr"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -22,7 +22,7 @@ var (
 	gitDate   string
 	app       = &cli.App{
 		Name:        filepath.Base(os.Args[0]),
-		Usage:       "go-ethereum rororo tool",
+		Usage:       "go-ethereum rrr tool",
 		Version:     params.VersionWithCommit(gitCommit, gitDate),
 		Writer:      os.Stdout,
 		HideVersion: true,
@@ -99,21 +99,21 @@ func genextra(ctx *cli.Context) error {
 		return err
 	}
 
-	signerNodeID := rororo.Pub2NodeID(&key.PublicKey)
+	signerNodeID := rrr.Pub2NodeID(&key.PublicKey)
 
 	enodes, err := readNodesJSON(staticNodesJson)
 	if err != nil {
 		return err
 	}
 
-	var initIdents []rororo.Enrolment
+	var initIdents []rrr.Enrolment
 	for _, en := range enodes {
-		if initIdents, err = rororo.IdentInit(key, initIdents, rororo.Hash(en.ID())); err != nil {
+		if initIdents, err = rrr.IdentInit(key, initIdents, rrr.Hash(en.ID())); err != nil {
 			return err
 		}
 	}
 
-	extra := &rororo.GenesisExtraData{}
+	extra := &rrr.GenesisExtraData{}
 
 	// XXX: TODO cli option to provide explicit seed
 	seed := make([]byte, 8)
@@ -134,7 +134,7 @@ func genextra(ctx *cli.Context) error {
 	extraData := hex.EncodeToString(b)
 
 	// Before printing out the data, make sure it round trips ok.
-	extraDecoded := &rororo.GenesisExtraData{}
+	extraDecoded := &rrr.GenesisExtraData{}
 	err = rlp.DecodeBytes(b, extraDecoded)
 	if err != nil {
 		return err

@@ -527,7 +527,7 @@ func (ps *peerSet) idlePeers(minProtocol, maxProtocol int, idleCheck func(*peerC
 	for _, p := range ps.peers {
 		if p.version >= minProtocol && p.version <= maxProtocol ||
 			p.version == consensus.Istanbul99 ||
-			p.version == consensus.RoRoRo112 {
+			p.version == consensus.RRR112 {
 			if idleCheck(p) {
 				idle = append(idle, p)
 			}
