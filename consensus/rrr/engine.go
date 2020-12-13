@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -88,8 +89,8 @@ type RMsg struct {
 
 // API is a user facing RPC API to dump Istanbul state
 type API struct {
-	chain  consensus.ChainReader
-	rrr *engine
+	chain consensus.ChainReader
+	rrr   *engine
 }
 
 type ChainSubscriber interface {
@@ -186,8 +187,10 @@ type engine struct {
 	candidates map[common.Address]bool
 	endorsers  map[common.Address]bool
 	// Number of endorsers required to confirm an intent.
-	quorum    int
-	roundSeed int64 // stored for telemetry purposes, set only in nextRound
+	quorum int
+	// roundRand is re-seeded at the start of each round (nextRound) from the block seed
+	roundRand *rand.Rand // OWNED by the run() go-routine DO NOT USE from other threads.
+	roundSeed int64      // stored for telemetry purposes, set only in nextRound
 }
 
 func (e *engine) HexNodeID() string {
@@ -429,7 +432,7 @@ func (e *engine) RoundNumber() *big.Int {
 func (e *engine) Start(
 	reader consensus.ChainReader) error {
 
-	e.logger.Info("RRR Start")
+	e.logger.Debug("RRR Start")
 	e.runningMu.Lock()
 	defer e.runningMu.Unlock()
 	if e.runningCh != nil {
@@ -454,7 +457,7 @@ func (e *engine) Start(
 
 func (e *engine) Stop() error {
 
-	e.logger.Info("RRR stopping")
+	e.logger.Debug("RRR stopping")
 
 	if e.chainHeadSub != nil { // we are called from Start
 		e.chainHeadSub.Unsubscribe()
@@ -479,7 +482,7 @@ func (e *engine) Stop() error {
 // block, which may be different from the header's coinbase if a consensus
 // engine is based on signatures.
 func (e *engine) Author(header *types.Header) (common.Address, error) {
-	e.logger.Info("RRR Author")
+	e.logger.Debug("RRR Author")
 
 	_, sealerID, _, err := e.decodeHeaderSeal(header)
 	if err != nil {
@@ -489,9 +492,9 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 	sealingNodeAddr := common.Address(sealerID.Address())
 
 	if sealingNodeAddr == e.nodeAddr {
-		e.logger.Info("RRR sealed by self", "address", sealingNodeAddr)
+		e.logger.Debug("RRR sealed by self", "address", sealingNodeAddr)
 	} else {
-		e.logger.Info("RRR sealed by", "address", sealingNodeAddr)
+		e.logger.Debug("RRR sealed by", "address", sealingNodeAddr)
 	}
 	return sealingNodeAddr, nil
 }
@@ -500,7 +503,7 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 // given engine. Verifying the seal may be done optionally here, or explicitly
 // via the VerifySeal method.
 func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header, seal bool) error {
-	e.logger.Info("RRR VerifyHeader")
+	e.logger.Debug("RRR VerifyHeader")
 
 	return e.verifyBranchHeaders(chain, header, nil)
 }
@@ -510,7 +513,7 @@ func (e *engine) VerifyHeader(chain consensus.ChainReader, header *types.Header,
 // a results channel to retrieve the async verifications (the order is that of
 // the input slice).
 func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Header, seals []bool) (chan<- struct{}, <-chan error) {
-	e.logger.Info("RRR VerifyHeaders")
+	e.logger.Debug("RRR VerifyHeaders")
 
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
@@ -541,7 +544,7 @@ func (e *engine) VerifyHeaders(chain consensus.ChainReader, headers []*types.Hea
 // VerifyUncles verifies that the given block's uncles conform to the consensus
 // rules of a given engine.
 func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) error {
-	e.logger.Info("RRR VerifyUncles")
+	e.logger.Debug("RRR VerifyUncles")
 
 	if len(block.Uncles()) > 0 {
 		return errInvalidUncleHash
@@ -552,7 +555,7 @@ func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 // VerifySeal checks whether the crypto seal on a header is valid according to
 // the consensus rules of the given engine.
 func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
-	e.logger.Info("RRR VerifySeal")
+	e.logger.Debug("RRR VerifySeal")
 
 	if _, err := e.verifyHeader(chain, header); err != nil {
 		return err
@@ -563,7 +566,7 @@ func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) e
 // Prepare initializes the consensus fields of a block header according to the
 // rules of a particular engine. The changes are executed inline.
 func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) error {
-	e.logger.Info("RRR Prepare")
+	e.logger.Debug("RRR Prepare")
 
 	// Start witht the default vanity data and nothing else.
 	extra := make([]byte, RRRExtraVanity)
@@ -583,7 +586,7 @@ func (e *engine) Prepare(chain consensus.ChainReader, header *types.Header) erro
 func (e *engine) Finalize(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header) {
-	e.logger.Info("RRR Finalize")
+	e.logger.Trace("RRR Finalize")
 
 	// No block rewards in rrr, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
@@ -599,7 +602,7 @@ func (e *engine) FinalizeAndAssemble(
 	chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
 
-	e.logger.Info("RRR FinalizeAndAssemble", "#tx", len(txs))
+	e.logger.Debug("RRR FinalizeAndAssemble", "#tx", len(txs))
 
 	// No block rewards in rrr, so the state remains as is and uncles are dropped
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
@@ -619,7 +622,7 @@ func (e *engine) FinalizeAndAssemble(
 func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	hash := sealHash(block.Header())
 
-	e.logger.Info("RRR Seal", "bn", block.Number(), "#s", hex.EncodeToString(hash[:]))
+	e.logger.Debug("RRR Seal", "bn", block.Number(), "#s", hex.EncodeToString(hash[:]))
 	if !e.IsRunning() {
 		return fmt.Errorf("RRR Seal: %w", errEngineStopped)
 	}
@@ -636,7 +639,7 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 		if ph.Root == h.Root &&
 			ph.TxHash == h.TxHash &&
 			ph.ReceiptHash == h.ReceiptHash {
-			e.logger.Info(
+			e.logger.Debug(
 				"RRR Seal skip identical block",
 				"#tx", len(block.Transactions()), "txhash", h.TxHash.Hex(),
 			)
@@ -663,7 +666,7 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 // accidentally creating the same hash for different blocks).
 func (e *engine) SealHash(header *types.Header) common.Hash {
 	h := sealHash(header)
-	e.logger.Info("RRR SealHash", "#", h.Hex())
+	e.logger.Debug("RRR SealHash", "#", h.Hex())
 
 	return h
 }
@@ -696,7 +699,7 @@ func sealHash(header *types.Header) common.Hash {
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
 // that a new block should have. For rrr this is just the round number
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
-	e.logger.Info("RRR CalcDifficulty")
+	e.logger.Debug("RRR CalcDifficulty")
 
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
@@ -725,6 +728,6 @@ func (e *engine) Protocol() consensus.Protocol {
 
 // Close terminates any background threads maintained by the consensus engine.
 func (e *engine) Close() error {
-	e.logger.Info("RRR Close")
+	e.logger.Debug("RRR Close")
 	return nil
 }

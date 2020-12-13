@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"math/rand"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -77,6 +76,15 @@ type idActivity struct {
 	// genesiOrder is for telemetry, it is (or will be) undefined for nodes
 	// whose initial enrol is not in the genesis block.
 	genesisOrder int
+}
+
+// lastActiveBlock returns the higher of endorsedBlock and ageBlock
+func (a *idActivity) lastActiveBlock() *big.Int {
+
+	if a.endorsedBlock.Cmp(a.ageBlock) > 0 {
+		return a.endorsedBlock
+	}
+	return a.ageBlock
 }
 
 func (e *engine) primeActivitySelection(chain RRRChainReader) error {
@@ -253,34 +261,6 @@ func (e *engine) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big.Int
 	return aged
 }
 
-// return the hex string formed from the first head 'h' bytes, and last tail 't' bytes as hex,
-// formatted with a single '.'. h and t are clamped to len(Address) / 2 - 1
-func fmtAddrex(addr Address, h, t int) string {
-
-	if h < 1 && t < 1 {
-		return ""
-	}
-	if h < 0 {
-		h = 0
-	}
-	if t < 0 {
-		t = 0
-	}
-
-	if t > len(addr)-h-1 {
-		t = len(addr) - h - 1
-	}
-
-	if h > len(addr)-t-1 {
-		h = len(addr) - t - 1
-	}
-
-	start := addr[:h]
-	end := addr[len(addr)-t:]
-
-	return fmt.Sprintf("%s.%s", hex.EncodeToString(start), hex.EncodeToString(end))
-}
-
 // refreshAge called to indicate that nodeID has minted a block or been
 // enrolled. If this is the youngest block minted by the identity, we move its
 // entry after the fence.  Counter intuitively, we always insert the at the
@@ -308,7 +288,7 @@ func (e *engine) refreshAge(
 		if aged.ageBlock.Cmp(blockNumber) <= 0 {
 
 			e.logger.Trace("RRR refreshAge - move",
-				"addr", nodeAddr.Hex(), "age", fmt.Sprintf("%2d.%d->%d", order, aged.ageBlock, blockNumber))
+				"addr", nodeAddr.HexShort(), "age", fmt.Sprintf("%02d.%d->%d", order, aged.ageBlock, blockNumber))
 
 			if fence != nil {
 				// This is effectively MoveToBack, with fence as the logical back.Prev()
@@ -328,9 +308,9 @@ func (e *engine) refreshAge(
 		// in the idle pool because the age wasn't known when the activity was
 		// seen by recordActivity. In either event there is no previous age.
 		if aged = e.idlePool[nodeAddr]; aged != nil {
-			e.logger.Trace("RRR refreshAge - from idle", "addr", nodeAddr.Hex(), "age", fmt.Sprintf("%02d.%05d", order, blockNumber))
+			e.logger.Trace("RRR refreshAge - from idle", "addr", nodeAddr.HexShort(), "age", fmt.Sprintf("%02d.%05d", order, blockNumber))
 		} else {
-			e.logger.Trace("RRR refreshAge - new", "addr", nodeAddr.Hex(), "age", fmt.Sprintf("%02d.%05d", order, blockNumber))
+			e.logger.Trace("RRR refreshAge - new", "addr", nodeAddr.HexShort(), "age", fmt.Sprintf("%02d.%05d", order, blockNumber))
 			aged = newIDActivity(nodeID)
 		}
 		delete(e.idlePool, nodeAddr)
@@ -448,7 +428,7 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 
 			e.logger.Debug(
 				"RRR accumulateActive - sealer",
-				"addr", sealerID.Address().Hex(), "age", agemsg)
+				"addr", sealerID.Address().HexShort(), "age", agemsg)
 		} else {
 			// first block from this sealer since it went idle or was first
 			// enrolled. if it went idle we could have seen an endorsement for
@@ -456,7 +436,7 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 			// with the identity.
 			e.logger.Debug(
 				"RRR accumulateActive - new sealer",
-				"addr", sealerID.Address().Hex(), "age", fmt.Sprintf("00.%05d", cur.Number))
+				"addr", sealerID.Address().HexShort(), "age", fmt.Sprintf("00.%05d", cur.Number))
 		} // end telemetry only
 
 		// The sealer is minting and to preserve the "round" ordering, needs to
@@ -508,6 +488,9 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 func (e *engine) selectCandidatesAndEndorsers(
 	chain RRRChainReader, head *types.Block) (map[common.Address]bool, map[common.Address]bool, error) {
 
+	// for telemetry
+	round := e.RoundNumber()
+
 	header := head.Header()
 	if err := e.accumulateActive(chain, header); err != nil {
 		return nil, nil, err
@@ -554,7 +537,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 		return nil, nil, fmt.Errorf(
 			"%v < %v(c) +%v(q):%w", nActive, e.config.Candidates, e.config.Quorum, errInsuficientActiveIdents)
 	}
-	permutation := rand.Perm(nActive - int(e.config.Candidates))
+	permutation := e.roundRand.Perm(nActive - int(e.config.Candidates))
 	ne := e.config.Endorsers
 	if uint64(len(permutation)) < ne {
 		ne = uint64(len(permutation))
@@ -571,7 +554,9 @@ func (e *engine) selectCandidatesAndEndorsers(
 
 		age := cur.Value.(*idActivity)
 
-		if !e.withinActivityHorizon(age.endorsedBlock) {
+		lastActive := age.lastActiveBlock()
+
+		if !e.withinActivityHorizon(lastActive) {
 			e.logger.Trace("RRR selectCandEs - moving to idle set",
 				"gi", age.genesisOrder, "end", age.endorsedBlock, "last", e.activeBlockFence)
 			continue
@@ -600,12 +585,13 @@ func (e *engine) selectCandidatesAndEndorsers(
 			selection = append(selection, addr) // telemetry only
 			candidates[common.Address(addr)] = true
 
-			e.logger.Debug("RRR selectCandEs - select", "cand", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock))
+			e.logger.Debug(
+				"RRR selectCandEs - select",
+				"cand", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock),
+				"ic", len(candidates)-1, "a", lastActive, "r", round)
 			continue
 			// Note: divergence (1) leader candidates can not be endorsers
 		}
-
-		endorserPosition++ // endorserPosition advances for all active endorsers
 
 		// XXX: age < Te (created less than Te rounds) grinding attack mitigation
 
@@ -614,15 +600,27 @@ func (e *engine) selectCandidatesAndEndorsers(
 		// and select them by randomly chosen position in that ordering.
 		if pendingEndorserPositions[endorserPosition] {
 
-			e.logger.Debug("RRR selectCandEs - select", "endo", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock), "p", endorserPosition)
+			e.logger.Debug(
+				"RRR selectCandEs - select", "endo",
+				fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock),
+				"ie", endorserPosition, "a", lastActive, "r", round)
+
 			endorsers[common.Address(addr)] = true
 			selection = append(selection, addr) // telemetry only
 			delete(pendingEndorserPositions, endorserPosition)
+
+			// XXX: This short circuit needs more thought: For automatic
+			// re-enrolment to work we need to ensure entries which are idle (no
+			// activity within Ta of HEAD), are put in the idle pool. If we rely
+			// on collecting them as we sweep the list here, this short circuit
+			// makes their detection random (albiet the same random on all
+			// nodes).
 			if len(pendingEndorserPositions) == 0 {
 				e.logger.Trace("RRR selectCandEs - early out", "n", e.activeSelection.Len(), "e", len(candidates)+endorserPosition)
 				break // early out
 			}
 		}
+		endorserPosition++ // endorserPosition advances for all active endorsers
 	}
 
 	if true {
@@ -650,7 +648,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 				e.logger.Crit("element with no value", "addr", addr.Hex())
 			}
 
-			s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, fmtAddrex(addr, 3, 1))
+			s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, addr.HexShort())
 			if candidates[common.Address(addr)] {
 				strcans = append(strcans, s)
 			} else {
@@ -661,7 +659,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 		e.logger.Info("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
 	}
 
-	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation, "r", header.Number, "s", e.roundSeed)
+	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation, "r", round, "s", e.roundSeed)
 
 	return candidates, endorsers, nil
 }

@@ -99,9 +99,6 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 	// sufficient endorsments to produce a block, each leader candidate will
 	// simply re-broadcast their current intent.
 	roundState, roundNumber := e.nextRound(chain, nil)
-	if roundState == RoundStateLeaderCandidate {
-		e.logger.Debug("RRR leader candidate", "round", roundNumber)
-	}
 
 	for {
 		select {
@@ -235,10 +232,10 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			numRoundTicks += 1
 
 			if roundState != RoundStateLeaderCandidate {
-				e.logger.Debug("RRR round tick - endorsing", "ticks", numRoundTicks)
+				e.logger.Debug("RRR round tick - endorsing", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
 				continue
 			}
-			e.logger.Debug("RRR round tick - leader candidate", "ticks", numRoundTicks)
+			e.logger.Debug("RRR round tick - leader candidate", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
 
 			if confirmed, err = e.sealCurrentBlock(); err != nil {
 				e.logger.Info("RRR sealCurrentBlock", "err", err)
@@ -253,7 +250,7 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				}
 			}
 			if confirmed {
-				e.logger.Info("RRR sealed block", "round", roundNumber)
+				e.logger.Info("RRR sealed block", "addr", e.nodeAddr.Hex(), "round", roundNumber)
 			}
 		}
 	}
@@ -490,7 +487,7 @@ func (e *engine) nextRound(chain RRRChainReader, head *types.Block) (RoundState,
 		// There is no RRR seal on the genesis block
 		se, _, _, err := e.decodeHeaderSeal(head.Header())
 		if err != nil {
-			e.logger.Info("RRR nextRound - failed to decode header seal, will be inactive this round", "err", err)
+			e.logger.Info("RRR nextRound - failed to decode header seal, will be inactive this round", "err", err, "addr", e.nodeAddr.Hex(), "round", roundNumber)
 			return RoundStateInactive, roundNumber
 		}
 		seed = se.Seed
@@ -499,31 +496,33 @@ func (e *engine) nextRound(chain RRRChainReader, head *types.Block) (RoundState,
 	}
 
 	if len(seed) != 8 {
-		e.logger.Info("RRR nextRound - seed wrong length, will be inactive this round", "len", len(seed))
+		e.logger.Info("RRR nextRound - seed wrong length, will be inactive this round", "len", len(seed), "addr", e.nodeAddr.Hex(), "round", roundNumber)
 		return RoundStateInactive, roundNumber
 	}
 
 	// We record it in e only for telemetry, this is the only place it gets set.
 	e.roundSeed = int64(binary.LittleEndian.Uint64(seed))
-	rand.Seed(e.roundSeed)
+	e.roundRand = rand.New(rand.NewSource(e.roundSeed))
 
 	// If we are a leader candidate we need to broadcast an intent.
 	var err error
 	e.candidates, e.endorsers, err = e.selectCandidatesAndEndorsers(chain, head)
 	if err != nil {
-		e.logger.Info("RRR nextRound - select failed, skipping round", "err", err)
+		e.logger.Info("RRR nextRound - select failed, skipping round", "addr", e.nodeAddr.Hex(), "round", roundNumber, "err", err)
 		return RoundStateInactive, roundNumber
 	}
 
 	if !e.candidates[e.nodeAddr] {
 		if !e.endorsers[e.nodeAddr] {
-			e.logger.Info("RRR not a candidate leader or endorser")
+			e.logger.Info("RRR not a candidate leader or endorser", "addr", e.nodeAddr.Hex(), "round", roundNumber)
 			return RoundStateActive, roundNumber // XXX: everyone is considered active for now
 		}
-		e.logger.Info("RRR endorser committee")
+		e.logger.Info("RRR endorser committee", "addr", e.nodeAddr.Hex(), "round", roundNumber)
 		return RoundStateEndorserCommittee, roundNumber
 	}
 	e.intent = nil
+
+	e.logger.Info("RRR **** leader candidate ****", "addr", e.nodeAddr.Hex(), "round", roundNumber)
 
 	return RoundStateLeaderCandidate, roundNumber
 }
