@@ -160,6 +160,16 @@ type engine struct {
 	intentMsgHash Hash // we remember the most recent intent hash, even if the intent is cleared, to help with telemetry
 	intent        *pendingIntent
 
+	// On endorsing nodes, keep the oldest signed intent we have seen during
+	// the intent phase, until the end of the phase or until we see an intent
+	// from the oldest candidate.
+	signedIntent *engSignedIntent
+
+	// If we have seen an intent from the oldest candidate we will have sent
+	// the endorsement imediately, and we need this flag to remember we did
+	// that.
+	sentEndorsement bool
+
 	// activeSelection  is maintained in identity age order - with the youngest at
 	// the front.
 	activeSelection *list.List                // list of *idActive
@@ -184,6 +194,7 @@ type engine struct {
 
 	// These get updated each round on all nodes without regard to which are
 	// leaders/endorsers or participants.
+	selection  []common.Address // age ordered selected candidates and endorsers for the round
 	candidates map[common.Address]bool
 	endorsers  map[common.Address]bool
 	// Number of endorsers required to confirm an intent.
@@ -207,6 +218,12 @@ func (e *engine) IsRunning() bool {
 func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consensus.RRR {
 
 	logger := log.New()
+
+	if config.ConfirmPhase > config.RoundLength {
+		logger.Crit("confirm phase can not be longer than the round",
+			"confirmphase", config.ConfirmPhase, "roundlength", config.RoundLength)
+	}
+
 	// Only get err from NewRC if zize requested is <=0
 	peerMessages, _ := lru.NewARC(lruPeers)
 	selfMessages, _ := lru.NewARC(lruMessages)
@@ -277,6 +294,8 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 	switch rmsg.Code {
 	case RMsgIntent:
 
+		e.logger.Trace("RRR HandleMsg - post engSignedIntent")
+
 		si := &engSignedIntent{ReceivedAt: data.ReceivedAt, Seq: rmsg.Seq}
 
 		if si.Pub, err = si.DecodeSigned(NewBytesStream([]byte(rmsg.Raw))); err != nil {
@@ -284,13 +303,15 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 			return true, err
 		}
 
-		e.logger.Trace("RRR HandleMsg - post engSignedIntent")
-		e.runningCh <- si
+		if !e.postIfRunning(si) {
+			e.logger.Info("RRR Intent engine not running")
+		}
 
 		return true, nil
 
 	case RMsgConfirm:
 
+		e.logger.Trace("RRR HandleMsg - post engSignedEndorsement")
 		sc := &engSignedEndorsement{ReceivedAt: data.ReceivedAt, Seq: rmsg.Seq}
 
 		r := bytes.NewReader([]byte(rmsg.Raw))
@@ -301,8 +322,9 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 			return true, err
 		}
 
-		e.logger.Trace("RRR HandleMsg - post engSignedEndorsement")
-		e.runningCh <- sc
+		if !e.postIfRunning(sc) {
+			e.logger.Info("RRR Endorsement engine not running")
+		}
 
 		return true, nil
 
@@ -429,6 +451,17 @@ func (e *engine) RoundNumber() *big.Int {
 	return big.NewInt(0).Set(e.roundNumber)
 }
 
+func (e *engine) postIfRunning(i interface{}) bool {
+	e.runningMu.Lock()
+	defer e.runningMu.Unlock()
+	if e.runningCh == nil {
+		return false
+	}
+
+	e.runningCh <- i
+	return true
+}
+
 func (e *engine) Start(
 	reader consensus.ChainReader) error {
 
@@ -444,9 +477,13 @@ func (e *engine) Start(
 		return errIncompatibleChainReader
 	}
 
-	if err := e.primeActivitySelection(chain); err != nil {
-		return err
+	if e.activeSelection == nil {
+		if err := e.primeActivitySelection(chain); err != nil {
+			return err
+		}
 	}
+	// else we are re-starting, accumulateActive will catch up as appropriate
+	// for the new head
 
 	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
 	e.runningCh = make(chan interface{})
@@ -459,11 +496,12 @@ func (e *engine) Stop() error {
 
 	e.logger.Debug("RRR stopping")
 
-	if e.chainHeadSub != nil { // we are called from Start
+	e.runningMu.Lock()
+
+	if e.chainHeadSub != nil {
 		e.chainHeadSub.Unsubscribe()
 	}
 
-	e.runningMu.Lock()
 	if e.runningCh != nil {
 
 		close(e.runningCh)
@@ -627,33 +665,14 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 		return fmt.Errorf("RRR Seal: %w", errEngineStopped)
 	}
 
-	// Without this check we mine blocks constantly, which may be what we want
-	// ... yet with it we stall. not sure why yet
-	if false {
-		h := block.Header()
-		n := h.Number.Uint64()
-		ph := chain.GetHeader(h.ParentHash, n-1)
-		if ph == nil {
-			return consensus.ErrUnknownAncestor
-		}
-		if ph.Root == h.Root &&
-			ph.TxHash == h.TxHash &&
-			ph.ReceiptHash == h.ReceiptHash {
-			e.logger.Debug(
-				"RRR Seal skip identical block",
-				"#tx", len(block.Transactions()), "txhash", h.TxHash.Hex(),
-			)
-			results <- nil
-			return nil
-		}
-	}
-
-	// XXX: If we have a intent and the required confirmations for the block,
-	// sign it. In ethhash, this is where the PoW happens
-
-	e.runningCh <- &engSealTask{
+	st := &engSealTask{
 		RoundNumber: e.RoundNumber(),
 		Block:       block, Results: results, Stop: stop}
+
+	// Note: in ethhash, this is where the PoW happens
+	if !e.postIfRunning(st) {
+		return fmt.Errorf("RRR Seal: %w", errEngineStopped)
+	}
 
 	return nil
 }

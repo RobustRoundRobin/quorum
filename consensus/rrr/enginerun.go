@@ -22,7 +22,6 @@ var (
 )
 
 // eng* types can be sent at any tome the the engines main channel.
-// engStop
 
 // engSealTask is sent to the engines runningCh to request endorsment to
 // create a block. This is initiated by the local miner invoking Seal interface
@@ -73,7 +72,8 @@ type pendingIntent struct {
 	Endorsers map[common.Address]bool
 }
 
-type RoundState int
+type RoundState int // todo: rename -> RoundRole
+type RoundPhase int
 
 const (
 	RoundStateInvalid RoundState = iota
@@ -83,13 +83,29 @@ const (
 	RoundStateEndorserCommittee // Is in the endorser committee for the current round.
 )
 
+const (
+	RoundPhaseInvalid RoundPhase = iota
+	// During the Intent phase, the endorser committee is allowing for intents
+	// to arrive so they can, with high probability,  pick the oldest active
+	// leader candidate.
+	RoundPhaseIntent
+	// During the confirmation phase leaders are waiting for all the
+	// endorsements to comine so they fairly represent activity.
+	RoundPhaseConfirm
+)
+
 func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 
 	defer e.runningWG.Done()
 	e.runningWG.Add(1)
 
 	roundDuration := time.Duration(e.config.RoundLength) * time.Millisecond
-	roundTick := time.NewTimer(roundDuration)
+	confirmPhaseDuration := time.Duration(e.config.ConfirmPhase) * time.Millisecond
+	intentPhaseDuration := time.Duration(e.config.RoundLength-e.config.ConfirmPhase) * time.Millisecond
+	e.logger.Info("run starting", "roundDur", roundDuration, "conDur", confirmPhaseDuration, "intDur", intentPhaseDuration)
+
+	roundPhase := RoundPhaseIntent
+	roundTick := time.NewTimer(intentPhaseDuration)
 	numRoundTicks := 0 // the count of ticks that have elapsed since last block, this should ideal stay at 0 or 1.
 
 	// Endorsed leader candidates will broadcast the new block at the end of
@@ -123,10 +139,12 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			// particular round.  Chosing not to incorporate the block time
 			// stamp as yet. Note that go timers are quite tricky, see
 			// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
+
 			if !roundTick.Stop() { // Stop and drain
 				<-roundTick.C
 			}
-			roundTick.Reset(roundDuration)
+			roundTick.Reset(intentPhaseDuration)
+			roundPhase = RoundPhaseIntent
 
 			roundState, roundNumber = e.nextRound(chain, newHead.Block)
 			if roundState != RoundStateLeaderCandidate {
@@ -158,6 +176,7 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				e.logger.Info("RRR run - input channel closed")
 				return
 			}
+
 			switch et := i.(type) {
 
 			case *engSealTask:
@@ -176,9 +195,6 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 					e.logger.Info("RRR engSealTask - refreshSealTask", "err", err)
 					continue
 				}
-				if err := e.broadcastCurrentIntent(); err != nil {
-					e.logger.Info("RRR engSealTask - broadcastCurrentIntent", "err", err)
-				}
 				// intent -> leader candidates
 
 			case *engSignedIntent:
@@ -193,10 +209,10 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				}
 
 				e.logger.Info("RRR run got engSignedIntent",
-					"round", e.RoundNumber(),
-					"candidate-round", et.RoundNumber,
+					"round", e.RoundNumber(), "candidate-round", et.RoundNumber,
 					"candidate", et.NodeID.Hex(), "parent", et.ParentHash.Hex())
-				if err := e.handleIntent(et); err != nil {
+
+				if err := e.handleIntent(et, roundNumber); err != nil {
 					e.logger.Info("RRR run handleIntent", "err", err)
 				}
 
@@ -211,11 +227,24 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 					continue
 				}
 
+				// XXX: divergence (3) the paper handles endorsements only in
+				// the confirmation phase. It is important that all identities
+				// get an opportunity to record activity. I think the key point
+				// is that a quorum of fast nodes can't starve 'slow' nodes. So
+				// as long as the window is consistent for all, it doesn't
+				// really matter what it is. And it is (a little) easier to
+				// just accept endorsements at any time in the round.
+
 				e.logger.Trace("RRR run got engSignedEndorsement",
 					"round", e.RoundNumber(),
 					"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
+
+				// Provided the endorsment is for our outstanding intent and
+				// from an identity we have selected as an endorser in this
+				// round, then its endorsment will be included in the block -
+				// whether we needed it to reach the endorsment quorum or not.
 				if err := e.handleEndorsement(et); err != nil {
-					e.logger.Info("rrr run handleIntent", "err", err)
+					e.logger.Info("RRR run handleIntent", "err", err)
 				}
 
 			default:
@@ -227,24 +256,47 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			var err error
 
 			// We MUST reset, else the Stop when a new block arrives will block
-			roundTick.Reset(roundDuration)
+			if roundPhase == RoundPhaseIntent {
+				// Completed intent phase, if we have a signedIntent here, it
+				// means we have not seen an intent from the oldest selected
+				// and this is the oldest we have seen. So go ahead and send
+				// it. This gives us liveness in the face of network issues and
+				// misbehaviour.  The > Nc the stronger the mitigation.
+				if e.signedIntent != nil {
+					oldestSeen := e.signedIntent.NodeID.Address()
+					e.logger.Info("RRR intent phase - sending endorsment to oldest seen", "addr", oldestSeen.Hex())
+					e.sendSignedEndorsement(oldestSeen, e.signedIntent)
+					e.signedIntent = nil
+				}
+				e.sentEndorsement = false
 
+				e.logger.Debug("RRR start confirm phase", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
+				roundTick.Reset(confirmPhaseDuration)
+				roundPhase = RoundPhaseConfirm
+				continue
+			}
+
+			// completed confirm phase
+			roundTick.Reset(intentPhaseDuration)
+			roundPhase = RoundPhaseIntent
 			numRoundTicks += 1
 
 			if roundState != RoundStateLeaderCandidate {
-				e.logger.Debug("RRR round tick - endorsing", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
+				e.logger.Debug("RRR start intent phase - endorsing", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
 				continue
 			}
-			e.logger.Debug("RRR round tick - leader candidate", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
 
 			if confirmed, err = e.sealCurrentBlock(); err != nil {
 				e.logger.Info("RRR sealCurrentBlock", "err", err)
 				continue
 			}
+
+			e.logger.Debug("RRR start intent phase - leader candidate", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
 			if !confirmed {
 				if err = e.refreshSealTask(nil); err != nil {
 					e.logger.Info("RRR refresing seal task", "err", err)
 				}
+				e.logger.Info("RRR broadcasting intent", "addr", e.nodeAddr.Hex(), "ticks", numRoundTicks)
 				if err = e.broadcastCurrentIntent(); err != nil {
 					e.logger.Info("RRR broadcasting intent", "err", err)
 				}
@@ -256,7 +308,7 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 	}
 }
 
-func (e *engine) handleIntent(et *engSignedIntent) error {
+func (e *engine) handleIntent(et *engSignedIntent, roundNumber *big.Int) error {
 
 	var err error
 	// Don't call handleIntent unless selected for the endorser committee
@@ -274,17 +326,70 @@ func (e *engine) handleIntent(et *engSignedIntent) error {
 	if recoveredNodeID, err = PubBytes2NodeID(et.Pub); err != nil {
 		return err
 	}
+	intenderAddr := et.NodeID.Address()
+
 	if recoveredNodeID != et.NodeID {
-		return errIntentSigInconsistent
+		e.logger.Info("RRR handleIntent - sender not signer",
+			"from-addr", intenderAddr.Hex(), "recovered", recoveredNodeID.Hex(), "signed", et.NodeID.Hex())
+		return nil
+	}
+
+	// Check that the intent round matches our current round.
+	if roundNumber.Cmp(et.RoundNumber) != 0 {
+		e.logger.Info("RRR handleIntent - wrong round",
+			"r", roundNumber, "ir", et.RoundNumber, "from-addr", intenderAddr.Hex())
+		return nil
 	}
 
 	// Check that the intent comes from a node we have selected locally as a
 	// leader candidate.
-	intenderAddr := et.NodeID.Address()
 	if !e.candidates[common.Address(intenderAddr)] {
-		e.logger.Info("RRR endorser leader selection excludes intent", "intent-nodeid", intenderAddr.Hex())
-		return errIntentNotFromLeader
+		e.logger.Info("RRR handleIntent - intent from non-candidate", "addr", intenderAddr.Hex())
+		return nil
 	}
+
+	if e.sentEndorsement {
+		// We could do this check earlier, but it is useful, at least for now,
+		// to get logs for any malformed  or late intents on all nodes that see
+		// them.
+		e.logger.Info("RRR handleIntent - endorsed oldest already, ignoring intent from", "addr", intenderAddr.Hex())
+		return nil
+	}
+
+	// If we see an intent from the oldest candidate, send the endorsment
+	// immediately.
+	if intenderAddr == Address(e.selection[0]) { // its a programming error if this slice is empty
+
+		e.logger.Info("RRR handleIntent - sending endorsment, have intent from oldest", "addr", intenderAddr.Hex())
+		err = e.sendSignedEndorsement(intenderAddr, et)
+		if err != nil {
+			return err
+		}
+		e.sentEndorsement = true
+		// If we have seen a younger candidate first, forget it.
+		e.signedIntent = nil
+	}
+
+	if e.signedIntent != nil {
+		// It must be in the map if it was in the candidates map, otherwise we
+		// have a programming error.
+		curAge := e.aged[e.signedIntent.NodeID.Address()].Value.(*idActivity).ageBlock
+		newAge := e.aged[intenderAddr].Value.(*idActivity).ageBlock
+
+		// Careful here, the 'older' block will have the *lower* number
+		if curAge.Cmp(newAge) < 0 {
+			// current is older
+			e.logger.Info("RRR handleIntent - have intent for older candidate, ignoring from", "addr", intenderAddr.Hex())
+			return nil
+		}
+	}
+
+	// Its the first one, or it is from an older candidate and yet is not the oldest
+	e.signedIntent = et
+	return nil
+}
+
+func (e *engine) sendSignedEndorsement(intenderAddr Address, et *engSignedIntent) error {
 
 	c := &SignedEndorsement{
 		Endorsement: Endorsement{
@@ -292,7 +397,12 @@ func (e *engine) handleIntent(et *engSignedIntent) error {
 			EndorserID: e.nodeID,
 		},
 	}
+
+	var err error
 	c.IntentHash, err = et.SignedIntent.Hash()
+	if err != nil {
+		return err
+	}
 
 	// Note: by including the senders sequence, and remembering that the sender
 	// will be changing the round also, we can be sure we will reply even if
@@ -315,6 +425,7 @@ func (e *engine) handleIntent(et *engSignedIntent) error {
 
 	// find the peer candidate
 	return e.Send(common.Address(intenderAddr), msg)
+
 }
 
 func (e *engine) handleEndorsement(et *engSignedEndorsement) error {
@@ -398,9 +509,9 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 		return false, nil
 	}
 
-	if len(e.intent.Endorsements) != int(e.config.Quorum) {
+	if len(e.intent.Endorsements) < int(e.config.Quorum) {
 		got := len(e.intent.Endorsements)
-		e.logger.Info("RRR insuffcient endorsers to become leader",
+		e.logger.Info("RRR insufficient endorsers to become leader",
 			"q", int(e.config.Quorum), "got", got, "ends", len(e.endorsers))
 		return false, nil
 	}
@@ -454,9 +565,11 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 
 	header.Extra = append(header.Extra[:RRRExtraVanity], []byte(seal)...)
 
-	e.sealTask.Results <- e.sealTask.Block.WithSeal(header)
+	block := e.sealTask.Block.WithSeal(header)
+	e.sealTask.Results <- block
 	e.sealTask = nil
 	e.intent = nil
+	e.logger.Info("RRR sealCurrentBlock - sealed header", "addr", e.nodeAddr.Hex(), "#", block.Hash())
 
 	// XXX: TODO decide if legitimate leader candidate and if in correct phase
 
@@ -481,6 +594,9 @@ func (e *engine) nextRound(chain RRRChainReader, head *types.Block) (RoundState,
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
 
+	e.signedIntent = nil
+	e.sentEndorsement = false
+
 	// First, seed the random sequence for the round from the block seed.
 	var seed []byte
 	if head.Number().Cmp(big0) > 0 {
@@ -496,7 +612,8 @@ func (e *engine) nextRound(chain RRRChainReader, head *types.Block) (RoundState,
 	}
 
 	if len(seed) != 8 {
-		e.logger.Info("RRR nextRound - seed wrong length, will be inactive this round", "len", len(seed), "addr", e.nodeAddr.Hex(), "round", roundNumber)
+		// e.logger.Info("RRR nextRound - seed wrong length, will be inactive this round", "len", len(seed), "addr", e.nodeAddr.Hex(), "round", roundNumber)
+		e.logger.Crit("RRR nextRound - seed wrong length, will be inactive this round", "len", len(seed), "addr", e.nodeAddr.Hex(), "round", roundNumber)
 		return RoundStateInactive, roundNumber
 	}
 
@@ -506,7 +623,7 @@ func (e *engine) nextRound(chain RRRChainReader, head *types.Block) (RoundState,
 
 	// If we are a leader candidate we need to broadcast an intent.
 	var err error
-	e.candidates, e.endorsers, err = e.selectCandidatesAndEndorsers(chain, head)
+	e.candidates, e.endorsers, e.selection, err = e.selectCandidatesAndEndorsers(chain, head)
 	if err != nil {
 		e.logger.Info("RRR nextRound - select failed, skipping round", "addr", e.nodeAddr.Hex(), "round", roundNumber, "err", err)
 		return RoundStateInactive, roundNumber

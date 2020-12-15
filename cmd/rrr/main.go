@@ -48,6 +48,7 @@ var genesisExtraCommand = cli.Command{
 	Usage:  "Extra data for genesis document",
 	Action: genextra,
 	Flags: []cli.Flag{
+		cli.BoolFlag{Name: "showids", Usage: "Also print the corresponding identities (node addresses)"},
 		cli.StringFlag{Name: "datadir", Usage: "by default look for static-nodes.json in this directory"},
 		cli.StringFlag{Name: "key", Value: "key", Usage: "private key for the chain creator node (Ck)"},
 	},
@@ -147,6 +148,12 @@ func genextra(ctx *cli.Context) error {
 		return fmt.Errorf("genesis extra data serialisation is broken")
 	}
 	fmt.Println(extraData)
+
+	if ctx.Bool("showids") {
+		for i, en := range enodes {
+			fmt.Printf("%02d %s\n", i, rrr.Hash(en.ID()).Address().Hex())
+		}
+	}
 
 	return nil
 }

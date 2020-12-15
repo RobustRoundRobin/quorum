@@ -106,6 +106,12 @@ func (e *engine) primeActivitySelection(chain RRRChainReader) error {
 		}
 	}
 
+	// Note: block sync will stop the consensus. On re-start this will discard
+	// the current activeSelection. If we have a list (re-start) then we also
+	// need to reset the last block hash seen.
+	// if e.activeSelection != nil {
+	// 	e.lastBlockSeen = zeroHash
+	// }
 	e.activeSelection = list.New()
 
 	// All of the enrolments in the genesis block are signed by the long term
@@ -486,14 +492,14 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 // assuming the start from the same `head'. This is both SelectCandidates and
 // SelectEndorsers from the paper.
 func (e *engine) selectCandidatesAndEndorsers(
-	chain RRRChainReader, head *types.Block) (map[common.Address]bool, map[common.Address]bool, error) {
+	chain RRRChainReader, head *types.Block) (map[common.Address]bool, map[common.Address]bool, []common.Address, error) {
 
 	// for telemetry
 	round := e.RoundNumber()
 
 	header := head.Header()
 	if err := e.accumulateActive(chain, header); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Start with the oldest identity, and iterate towards the youngest. Move
@@ -516,10 +522,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 	candidates := make(map[common.Address]bool)
 	endorsers := make(map[common.Address]bool)
 
-	// We do some book keeping in the interests of useful logs - it is
-	// essential/very useful to be able to see the orderings and selections in
-	// the logs.
-	selection := make([]Address, 0, e.config.Candidates+e.config.Endorsers)
+	selection := make([]common.Address, 0, e.config.Candidates+e.config.Endorsers)
 
 	var next *list.Element
 	e.logger.Trace("RRR selectCandEs", "agelen", len(e.aged))
@@ -534,7 +537,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 	// us a random selection of endorsers with replacement.
 	nActive := e.activeSelection.Len()
 	if uint64(nActive) < e.config.Candidates+e.config.Quorum {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"%v < %v(c) +%v(q):%w", nActive, e.config.Candidates, e.config.Quorum, errInsuficientActiveIdents)
 	}
 	permutation := e.roundRand.Perm(nActive - int(e.config.Candidates))
@@ -570,9 +573,10 @@ func (e *engine) selectCandidatesAndEndorsers(
 		if uint64(len(candidates)) < e.config.Candidates {
 
 			// A candidate that is oldest for Nc rounds is moved to the idle pool
-			if len(candidates) == 1 {
+			if len(candidates) == 0 {
 				age.oldestFor++
 			}
+
 			// TODO: Complete the guard against unresponsive nodes, can't until
 			// we sort out the relationship between blocks and rounds
 			if age.oldestFor > int(e.config.Candidates) {
@@ -582,7 +586,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 					"nodeid", age.nodeID.Address().Hex(), "oldestFor", age.oldestFor)
 			}
 
-			selection = append(selection, addr) // telemetry only
+			selection = append(selection, common.Address(addr)) // telemetry only
 			candidates[common.Address(addr)] = true
 
 			e.logger.Debug(
@@ -606,7 +610,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 				"ie", endorserPosition, "a", lastActive, "r", round)
 
 			endorsers[common.Address(addr)] = true
-			selection = append(selection, addr) // telemetry only
+			selection = append(selection, common.Address(addr)) // telemetry only
 			delete(pendingEndorserPositions, endorserPosition)
 
 			// XXX: This short circuit needs more thought: For automatic
@@ -633,13 +637,13 @@ func (e *engine) selectCandidatesAndEndorsers(
 
 		for _, addr := range selection {
 
-			if addr == zeroAddr {
+			if Address(addr) == zeroAddr {
 				e.logger.Info("RRR RRR selectCandEs - no endorsers, to few candidates",
 					"len", len(selection), "nc", e.config.Candidates, "ne", e.config.Endorsers)
 				break // fewer than desired candidates
 			}
 			// it is a programming error if we get nil here, either for the map entry or for the type assertion
-			el := e.aged[addr]
+			el := e.aged[Address(addr)]
 			if el == nil {
 				e.logger.Crit("no entry for", "addr", addr.Hex())
 			}
@@ -648,7 +652,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 				e.logger.Crit("element with no value", "addr", addr.Hex())
 			}
 
-			s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, addr.HexShort())
+			s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, Address(addr).HexShort())
 			if candidates[common.Address(addr)] {
 				strcans = append(strcans, s)
 			} else {
@@ -659,7 +663,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 		e.logger.Info("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
 	}
 
-	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation, "r", round, "s", e.roundSeed)
+	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation, "r", round, "s", e.roundSeed, "h#", head.Hash())
 
-	return candidates, endorsers, nil
+	return candidates, endorsers, selection, nil
 }
