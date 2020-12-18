@@ -5,8 +5,8 @@ long term validator identities (node private keys), this approach scales to
 
 The general approach is defined by this [paper](https://arxiv.org/pdf/1804.07391.pdf)
 
-It is the intention of this fork to provide a production grade implementation.
-The ultimate goal is to have this accepted upstream.
+It is the intention of this work to provide a production grade implementation that is accepted
+by upstream quorum as a PR.
 
 We maintain a detailed description of the implementation approach 
 [here](https://github.com/RobustRoundRobin/devclutter/blob/main/RRR-spec.md)
