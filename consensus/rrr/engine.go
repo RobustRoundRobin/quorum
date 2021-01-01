@@ -150,15 +150,15 @@ type engine struct {
 	// Handles all of the  eng* types and core.ChainHeadEvent
 	runningCh chan interface{}
 
-	roundNumberC  *sync.Cond
-	roundNumberMu sync.RWMutex // is held by roundNumberC
-	roundNumber   *big.Int
+	intentMu sync.Mutex
+	sealTask *engSealTask
+	intent   *pendingIntent
 
-	intentMu      sync.Mutex
-	sealTask      *engSealTask
-	intentSeq     uint // ensures we re-issue the intent even if the round doesn't change
-	intentMsgHash Hash // we remember the most recent intent hash, even if the intent is cleared, to help with telemetry
-	intent        *pendingIntent
+	// If we get a new seal task during our intent phase, we hold on to it
+	// until the phase is over, else we would invalidate the intent we have
+	// published. The queue only needs to be 1 deep
+	nextSealTask *engSealTask
+	nextIntent   *pendingIntent
 
 	// On endorsing nodes, keep the oldest signed intent we have seen during
 	// the intent phase, until the end of the phase or until we see an intent
@@ -228,26 +228,20 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 	peerMessages, _ := lru.NewARC(lruPeers)
 	selfMessages, _ := lru.NewARC(lruMessages)
 	e := &engine{
-		config:       config,
-		privateKey:   privateKey,
-		nodeID:       Pub2NodeID(&privateKey.PublicKey),
-		nodeAddr:     crypto.PubkeyToAddress(privateKey.PublicKey),
-		logger:       logger,
-		db:           db,
-		chainHeadCh:  make(chan core.ChainHeadEvent),
-		peerMessages: peerMessages,
-		selfMessages: selfMessages,
-
-		// Broadcast is called on every round change
-		roundNumberMu: sync.RWMutex{},
-		roundNumber:   big.NewInt(0),
-
+		config:           config,
+		privateKey:       privateKey,
+		nodeID:           Pub2NodeID(&privateKey.PublicKey),
+		nodeAddr:         crypto.PubkeyToAddress(privateKey.PublicKey),
+		logger:           logger,
+		db:               db,
+		chainHeadCh:      make(chan core.ChainHeadEvent),
+		peerMessages:     peerMessages,
+		selfMessages:     selfMessages,
 		aged:             make(map[Address]*list.Element),
 		idlePool:         make(map[Address]*idActivity),
 		lastBlockSeen:    Hash{},
 		activeBlockFence: nil,
 	}
-	e.roundNumberC = sync.NewCond(&e.roundNumberMu)
 
 	return e
 }
@@ -430,25 +424,6 @@ func (e *engine) updateInboundMsgTracking(peerAddr common.Address, hash Hash) bo
 // Which, for the quorum fork, is called by eth/handler.go NewProtocolManager
 func (e *engine) SetBroadcaster(broadcaster consensus.Broadcaster) {
 	e.broadcaster = broadcaster
-}
-
-// NotifyRoundChange send val to the notify channel when the round number
-// changes (it does not care if it increases or decreases, only that it
-// changes)
-func (e *engine) NotifyRoundChange(notify chan<- interface{}, val interface{}) {
-	e.roundNumberC.L.Lock()
-	currentRound := big.NewInt(0).Set(e.roundNumber)
-	for e.roundNumber.Cmp(currentRound) == 0 {
-		e.roundNumberC.Wait()
-	}
-	e.roundNumberC.L.Unlock()
-	notify <- val
-}
-
-func (e *engine) RoundNumber() *big.Int {
-	e.roundNumberMu.RLock()
-	defer e.roundNumberMu.RUnlock()
-	return big.NewInt(0).Set(e.roundNumber)
 }
 
 func (e *engine) postIfRunning(i interface{}) bool {
@@ -666,8 +641,7 @@ func (e *engine) Seal(chain consensus.ChainReader, block *types.Block, results c
 	}
 
 	st := &engSealTask{
-		RoundNumber: e.RoundNumber(),
-		Block:       block, Results: results, Stop: stop}
+		Block: block, Results: results, Stop: stop}
 
 	// Note: in ethhash, this is where the PoW happens
 	if !e.postIfRunning(st) {

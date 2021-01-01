@@ -11,8 +11,14 @@ type Intent struct {
 	// ChainID is established in the extradata of the genesis block
 	ChainID Hash
 	// NodeID is Keccak256 ( PublicKey X || Y )
-	NodeID      Hash
+	NodeID Hash
+	// RoundNumber is the block number proposed.
 	RoundNumber *big.Int
+	// FailedAttempts is the number of times the intent/confirm cycle completed
+	// on the node without a new block being produced. The validity of the
+	// proposer as a leader is depedent on both the RoundNumber and the
+	// FailedAttempts
+	FailedAttempts uint
 	// ParentHash parent block hash
 	ParentHash Hash
 	// TxHash is the hash of the transactions (merkle root for block)

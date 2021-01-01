@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
+	"math/rand"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -345,16 +347,22 @@ func (e *engine) refreshAge(
 }
 
 // Is the number within Ta blocks of the block head ?
-func (e *engine) withinActivityHorizon(n *big.Int) bool {
+func (e *engine) withinActivityHorizon(blockNumber *big.Int) bool {
 
 	// Note that activeBlockFence is intialised to the head block in Start
 
+	// depth = activeBlockFence - blockNumber
 	depth := big.NewInt(0).Set(e.activeBlockFence)
-	depth.Sub(depth, n)
+	depth.Sub(depth, blockNumber)
 	if !depth.IsUint64() {
+		// blockNumber is *higher* than our activity fence. blockNumber
+		// typically comes from an age record, which would imply we have a
+		// block extra data with an endorsement for a higher block number than
+		// itself, which is clearly invalid - we have to see the block in order
+		// that it gets into the age cache
 		e.logger.Trace(
-			"RRR blockWithinActivityHorizon - -ve depth",
-			"Ta", e.config.Activity, "n", n, "last", e.activeBlockFence)
+			"RRR withinActivityHorizon - future block",
+			"Ta", e.config.Activity, "bn", blockNumber, "last", e.activeBlockFence)
 		return false
 	}
 	if depth.Uint64() > e.config.Activity {
@@ -389,6 +397,7 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 	// list in descending age order back -> front (see the spec for a less
 	// dense description) Note the sealer is considered older than all of the
 	// identities it enrolls.
+	var reorgMoandedOnce bool
 	for {
 
 		h := Hash(cur.Hash())
@@ -413,8 +422,14 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 		// fence and we haven't matched the hash yet it means we have
 		// inconsistent results. The exception accommodates the first pass after
 		// node startup.
-		if e.lastBlockSeen != zeroHash && cur.Number.Cmp(e.activeBlockFence) <= 0 && head.Number.Cmp(big0) != 0 {
-			return fmt.Errorf("reached a lower block without matching hash of last seen: %w", errBranchDetected)
+		if !reorgMoandedOnce && e.lastBlockSeen != zeroHash && cur.Number.Cmp(e.activeBlockFence) <= 0 && head.Number.Cmp(big0) != 0 {
+			// return fmt.Errorf("reached a lower block without matching hash of last seen: %w", errBranchDetected)
+			e.logger.Warn(
+				"reached a lower block without matching hash of last seen, re-setting active selection",
+				"bn", head.Number, "#", head.Hash())
+			// provided verifyHeader is working, this is fine and just a normal
+			// chain re-org
+			reorgMoandedOnce = true
 		}
 
 		confirms, enrols, sealerID, sealerPub, err := e.decodeActivity(cur)
@@ -486,21 +501,52 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 	return nil
 }
 
+func (e *engine) leaderForRoundAttempt(
+	id Address, roundNumber *big.Int, failedAttempts uint) bool {
+
+	nActive := uint(e.activeSelection.Len())
+	iFirstLeader, iLastLeader := e.calcLeaderWindow(nActive, failedAttempts)
+
+	if iFirstLeader >= uint64(e.activeSelection.Len()) {
+		return false
+	}
+
+	cur, icur := e.activeSelection.Back(), uint64(0)
+	for ; cur != nil && icur <= iLastLeader; cur, icur = cur.Prev(), icur+1 {
+		if icur < iFirstLeader {
+			continue
+		}
+		if cur.Value.(*idActivity).nodeID.Address() == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *engine) calcLeaderWindow(
+	nActive, failedAttempts uint,
+) (uint64, uint64) {
+
+	// a = active mod  [ MAX (n active, Nc + Ne) ]
+	nc, ne := float64(e.config.Candidates), float64(e.config.Endorsers)
+	max := math.Max(float64(nActive), nc+ne)
+	a, _ := math.Modf(math.Mod(float64(failedAttempts), max))
+
+	iFirstLeader := uint64(math.Floor(a/nc) * nc)
+	iLastLeader := iFirstLeader + e.config.Candidates - 1
+	e.logger.Trace(
+		"RRR calcLeaderWindow", "f", failedAttempts, "if", iFirstLeader, "a", a, "max", max)
+	return iFirstLeader, iLastLeader
+}
+
 // selectCandidatesAndEndorsers determines if the current node is a leader
 // candidate and what the current endorsers are. The key requirement of RRR met
 // here  is that the results of this function should be the same on all nodes
-// assuming the start from the same `head'. This is both SelectCandidates and
-// SelectEndorsers from the paper.
+// assuming they run accumulateActive starting from the same `head' block. This
+// is both SelectCandidates and SelectEndorsers from the paper.
 func (e *engine) selectCandidatesAndEndorsers(
-	chain RRRChainReader, head *types.Block) (map[common.Address]bool, map[common.Address]bool, []common.Address, error) {
-
-	// for telemetry
-	round := e.RoundNumber()
-
-	header := head.Header()
-	if err := e.accumulateActive(chain, header); err != nil {
-		return nil, nil, nil, err
-	}
+	chain RRRChainReader, roundRand *rand.Rand, failedAttempts uint,
+) (map[common.Address]bool, map[common.Address]bool, []common.Address, error) {
 
 	// Start with the oldest identity, and iterate towards the youngest. Move
 	// any inactive identities encountered to the idle set (this is the only
@@ -519,39 +565,51 @@ func (e *engine) selectCandidatesAndEndorsers(
 	// pick the endorser entries by position in the age order sort of active
 	// identities. We can then eliminate the sort and also, usually, terminate
 	// the list scan early.
+	//
+	// XXX: NOTICE: divergence (4) If no block is produced in the configured
+	// time for intent+confirm, we re-sample. See RRR-spec.md Consensus Rounds
+	// for details. failedAttempts tracked the number of times the local node
+	// timer has expired withoug a block being produced.
+
+	nActive := uint(e.activeSelection.Len())
+	if nActive < uint(e.config.Candidates+e.config.Quorum) {
+		return nil, nil, nil, fmt.Errorf(
+			"%v < %v(c) +%v(q):%w", nActive, e.config.Candidates, e.config.Quorum, errInsuficientActiveIdents)
+	}
+
+	iFirstLeader, iLastLeader := e.calcLeaderWindow(nActive, failedAttempts)
+
 	candidates := make(map[common.Address]bool)
 	endorsers := make(map[common.Address]bool)
 
 	selection := make([]common.Address, 0, e.config.Candidates+e.config.Endorsers)
 
 	var next *list.Element
-	e.logger.Trace("RRR selectCandEs", "agelen", len(e.aged))
+	e.logger.Trace(
+		"RRR selectCandEs", "agelen", len(e.aged), "f", failedAttempts, "if", iFirstLeader)
 
-	// The permutation is limited to active endorser candidate positions. We
-	// will select e.config.Candidates as active entries before we consider the
-	// remaining active entries as endorsers.
+	// The permutation is limited to active endorser candidate positions. The
+	// leader candidates don't consume 'positions'
 	pendingEndorserPositions := map[int]bool{}
 
 	// Get a random permutation of ALL active identities eligible as endorsers,
 	// then take the first e.config.Endorsers in that permutation. This gives
 	// us a random selection of endorsers with replacement.
-	nActive := e.activeSelection.Len()
-	if uint64(nActive) < e.config.Candidates+e.config.Quorum {
-		return nil, nil, nil, fmt.Errorf(
-			"%v < %v(c) +%v(q):%w", nActive, e.config.Candidates, e.config.Quorum, errInsuficientActiveIdents)
+	permutation := roundRand.Perm(int(nActive) - int(e.config.Candidates))
+	iend := e.config.Endorsers
+	if uint64(len(permutation)) < iend {
+		iend = uint64(len(permutation))
 	}
-	permutation := e.roundRand.Perm(nActive - int(e.config.Candidates))
-	ne := e.config.Endorsers
-	if uint64(len(permutation)) < ne {
-		ne = uint64(len(permutation))
-	}
-	permutation = permutation[:ne]
+	permutation = permutation[:iend]
 	for _, r := range permutation {
 		pendingEndorserPositions[r] = true
 	}
 
+	// To apply the permutation *around* the leader window, we just add Nc to
+	// all endorser positions which are >= iFirstLeader
+
 	endorserPosition := 0
-	for cur := e.activeSelection.Back(); cur != nil; cur = next {
+	for cur, icur := e.activeSelection.Back(), uint64(0); cur != nil; cur, icur = next, icur+1 {
 
 		next = cur.Prev() // so we can remove, and yes, we are going 'backwards'
 
@@ -570,18 +628,23 @@ func (e *engine) selectCandidatesAndEndorsers(
 		// We are accumulating candidates and endorsers together. We stop once
 		// we have enough of *both* (or at the end of the list)
 
-		if uint64(len(candidates)) < e.config.Candidates {
+		if icur >= iFirstLeader && icur <= iLastLeader &&
+			uint64(len(candidates)) < e.config.Candidates {
 
 			// A candidate that is oldest for Nc rounds is moved to the idle pool
-			if len(candidates) == 0 {
+			if len(candidates) == 0 && failedAttempts == 0 {
+				// Note that we only increment oldestFor on the first attempt.
+				// It is a count of *rounds* that the identity has been oldest
+				// for. Age does not change with failedAttempts, and attempts
+				// are totaly un-coordinated
 				age.oldestFor++
 			}
 
-			// TODO: Complete the guard against unresponsive nodes, can't until
-			// we sort out the relationship between blocks and rounds
+			// TODO: Complete the guard against unresponsive nodes, we can now
+			// that we have sorted out the relationship between blocks and
+			// rounds and attempts. But its a little tricky, it essentially
+			// involves moving the window.
 			if age.oldestFor > int(e.config.Candidates) {
-				// Our chain will just stop progressing if Nc == 1, and that is ok
-				// for now.
 				e.logger.Info("RRR selectCandEs - unresponsive node (droping tbd)",
 					"nodeid", age.nodeID.Address().Hex(), "oldestFor", age.oldestFor)
 			}
@@ -592,10 +655,14 @@ func (e *engine) selectCandidatesAndEndorsers(
 			e.logger.Debug(
 				"RRR selectCandEs - select",
 				"cand", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock),
-				"ic", len(candidates)-1, "a", lastActive, "r", round)
+				"ic", len(candidates)-1, "a", lastActive)
 			continue
 			// Note: divergence (1) leader candidates can not be endorsers
 		}
+
+		// endorserPosition is the *index* into the random permutation, so
+		// there is nothing special to do here to account for the leader window
+		// - it just doesn't get advanced when we select a leader above.
 
 		// XXX: age < Te (created less than Te rounds) grinding attack mitigation
 
@@ -607,19 +674,15 @@ func (e *engine) selectCandidatesAndEndorsers(
 			e.logger.Debug(
 				"RRR selectCandEs - select", "endo",
 				fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock),
-				"ie", endorserPosition, "a", lastActive, "r", round)
+				"ie", endorserPosition, "a", lastActive)
 
 			endorsers[common.Address(addr)] = true
 			selection = append(selection, common.Address(addr)) // telemetry only
 			delete(pendingEndorserPositions, endorserPosition)
 
-			// XXX: This short circuit needs more thought: For automatic
-			// re-enrolment to work we need to ensure entries which are idle (no
-			// activity within Ta of HEAD), are put in the idle pool. If we rely
-			// on collecting them as we sweep the list here, this short circuit
-			// makes their detection random (albiet the same random on all
-			// nodes).
-			if len(pendingEndorserPositions) == 0 {
+			// If the leader window has moved all the way to the end, we can't
+			// break out early here.
+			if len(pendingEndorserPositions) == 0 && uint64(nActive-1) < iLastLeader {
 				e.logger.Trace("RRR selectCandEs - early out", "n", e.activeSelection.Len(), "e", len(candidates)+endorserPosition)
 				break // early out
 			}
@@ -663,7 +726,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 		e.logger.Info("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
 	}
 
-	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation, "r", round, "s", e.roundSeed, "h#", head.Hash())
+	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation)
 
 	return candidates, endorsers, selection, nil
 }

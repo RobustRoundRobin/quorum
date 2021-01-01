@@ -24,7 +24,6 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	// any other more intensive validation)
 
 	var err error
-	var se *SignedExtraData
 
 	number := header.Number.Uint64()
 
@@ -48,7 +47,7 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	}
 
 	// XXX: TODO just verify one deep for now
-	if se, err = e.verifyHeader(chain, header); err != nil {
+	if _, err = e.verifyHeader(chain, header); err != nil {
 		return err
 	}
 
@@ -60,20 +59,6 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	}
 	if parent == nil || parent.Number.Uint64() != number-1 || parent.Hash() != header.ParentHash {
 		return consensus.ErrUnknownAncestor
-	}
-
-	parentSE, _ /*sealerID*/, _ /*sealerPub*/, err := e.decodeHeaderSeal(header)
-	if err != nil {
-		return err
-	}
-
-	// XXX: until we sort out the round synchronisation, this can't be enabled.
-	// Also, currently, we get asked to verify local mining work on endorsers,
-	// so the block number for the local (never to be commited) work will be
-	// equal to the block number from the leader
-	if parentSE.Intent.RoundNumber.Cmp(se.Intent.RoundNumber) >= 0 {
-		e.logger.Info("RRR new block round number lower than current parent", "parent", parentSE.Intent.RoundNumber, "new", se.Intent.RoundNumber)
-		// return fmt.Errorf("rrr round number to young: %v > %v", parentSE.Intent.RoundNumber, se.Intent.RoundNumber)
 	}
 
 	return nil
@@ -95,6 +80,13 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	if se.Intent.ChainID != e.genesisEx.ChainID {
 		return se, fmt.Errorf(
 			"rrr sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
+	}
+
+	// Check that the round in the intent matches the block number
+	if se.Intent.RoundNumber.Cmp(header.Number) != 0 {
+		return se, fmt.Errorf(
+			"rrr sealed intent invalid intent round number: %s != block number: %s",
+			se.Intent.RoundNumber, header.Number)
 	}
 
 	// Ensure that the coinbase is valid
