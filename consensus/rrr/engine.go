@@ -453,7 +453,7 @@ func (e *engine) Start(
 	}
 
 	if e.activeSelection == nil {
-		if err := e.primeActivitySelection(chain); err != nil {
+		if err := e.resetActive(chain); err != nil {
 			return err
 		}
 	}
@@ -505,9 +505,9 @@ func (e *engine) Author(header *types.Header) (common.Address, error) {
 	sealingNodeAddr := common.Address(sealerID.Address())
 
 	if sealingNodeAddr == e.nodeAddr {
-		e.logger.Debug("RRR sealed by self", "address", sealingNodeAddr)
+		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr, "bn", header.Number)
 	} else {
-		e.logger.Debug("RRR sealed by", "address", sealingNodeAddr)
+		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr, "bn", header.Number)
 	}
 	return sealingNodeAddr, nil
 }

@@ -78,7 +78,9 @@ type RoundPhase int
 
 const (
 	RoundStateInvalid RoundState = iota
-	RoundStateInactive
+	// If beginBlock fails we can't recover without a new block - this state suggests a bug in verifyHeader
+	RoundStateNeedBlock
+	RoundStateInactive          // Indicates conditions we expect to be transitor - endorsers not online etc
 	RoundStateNodeStarting      // Node has just started up, wait long enough to allow for a block to be minted by live participants
 	RoundStateActive            // Has endorsed or mined in some time in the last Ta rounds.
 	RoundStateLeaderCandidate   // Selected as leader candidate for current round
@@ -87,6 +89,8 @@ const (
 
 func (s RoundState) String() string {
 	switch s {
+	case RoundStateNeedBlock:
+		return "RoundStateNeedBlock"
 	case RoundStateInvalid:
 		return "RoundStateInvalid"
 	case RoundStateInactive:
@@ -133,16 +137,11 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 	// align on the same time window for each round. In the absence of
 	// sufficient endorsments to produce a block, each leader candidate will
 	// simply re-broadcast their current intent.
-	// roundState, roundNumber := e.nextRound(chain, nil)
 
-	var roundSeed []byte
 	var roundRand *rand.Rand
-	var headBlock *types.Block
 
-	bigDiffTmp := big.NewInt(0)
 	roundState := RoundStateNodeStarting
 	roundNumber := big.NewInt(1) // default block is the first after genesis
-	newRoundNumber := big.NewInt(1)
 
 	failedAttempts := uint(0)
 	var endorsers map[common.Address]consensus.Peer
@@ -177,32 +176,10 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			roundTick.Reset(intentPhaseDuration)
 			roundPhase = RoundPhaseIntent
 
-			newRoundNumber, roundSeed, _, headBlock, err = e.readHead(chain, newHead.Block)
+			roundNumber, roundRand, err = e.nextRound(chain, newHead.Block, roundNumber)
 			if err != nil {
-				roundState = RoundStateInactive
-				e.logger.Info("RRR newHead > RoundStateInactive - failed to readHead", "err", err)
-				continue
-			}
-
-			roundRand = rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(roundSeed))))
-
-			if bigDiffTmp.Sub(newRoundNumber, roundNumber).Cmp(bigOne) > 0 {
-				e.logger.Info(
-					"RRR newHead skipping round", "cur", roundNumber, "new", newRoundNumber)
-			} else if bigDiffTmp.Cmp(big0) < 0 {
-				e.logger.Info(
-					"RRR newHead round moving backwards", "cur", roundNumber, "new", newRoundNumber)
-			}
-			roundNumber.Set(newRoundNumber)
-			roundNumber.Add(roundNumber, bigOne)
-
-			// The order is determined by age, which is determined by the last
-			// block number minted or the block of enrolement - indepdenent of
-			// how many tries the chain needed to produce a new block
-			if err := e.accumulateActive(chain, headBlock.Header()); err != nil {
-				e.logger.Info(
-					"RRR newHead > RoundStateInactive - accumulateActive failed", "err", err)
-				roundState = RoundStateInactive
+				roundState = RoundStateNeedBlock
+				e.logger.Warn("RRR newHead > RoundStateNeedBlock - corruption or bug ?", "err", err)
 				continue
 			}
 
@@ -283,6 +260,10 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 					e.logger.Trace("RRR engSignedIntent - node starting, ignoring", "et.round", et.RoundNumber)
 					continue
 				}
+				if roundState == RoundStateNeedBlock {
+					e.logger.Trace("RRR engSignedIntent - need block, ignoring", "et.round", et.RoundNumber)
+					continue
+				}
 				// See RRR-spec.md for a more thorough explanation, and for why
 				// we don't check the round phase or whether or not we -
 				// locally - have selected ourselves as an endorser.
@@ -340,6 +321,7 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 
 			// We MUST reset, else the Stop when a new block arrives will block
 			if roundPhase == RoundPhaseIntent {
+
 				// Completed intent phase, if we have a signedIntent here, it
 				// means we have not seen an intent from the oldest selected
 				// and this is the oldest we have seen. So go ahead and send
@@ -351,6 +333,17 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				// and failedAttempts now, I'm not sure having strict intent
 				// and confirmation phases makese sense - one 'attempt' phase
 				// timer should work just as well.
+
+				if roundState == RoundStateNeedBlock {
+					// If we don't have a valid head, we have no buisiness
+					// handing out endorsements
+					e.logger.Trace(
+						"RRR tick - intent phase - discarding endorsement due to round state",
+						"r", roundNumber, "f", failedAttempts, "state", roundState.String())
+
+					e.signedIntent = nil
+				}
+
 				if e.signedIntent != nil {
 					oldestSeen := e.signedIntent.NodeID.Address()
 					e.logger.Trace(
@@ -377,52 +370,43 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			// nextRound in the ticker
 			roundTick.Reset(intentPhaseDuration)
 
-			// On startup, we wait a round to see if we get a block from a
-			// currently live network. If not we assume we are the first (or
-			// among the first) nodes, to start or to catch up. Remember, the
-			// miner stops and the consensus engine while it is syncing.
+			// Deal with the 'old' state and any end conditions
+			switch roundState {
+			case RoundStateNodeStarting:
+				// On startup, we wait a round to see if we get a block from a
+				// currently live network. If not we assume we are the first
+				// (or among the first) nodes, to start or to catch up.
+				// Remember, the miner stops and the consensus engine while it
+				// is syncing.  If we haven't received a block from the network
+				// to pick the round from, we will use the current block
+				// according to the local database.
 
-			if roundState == RoundStateNodeStarting {
-
-				// If we haven't received a block from the network to pick the
-				// round from, we will use the current block according to the
-				// local database.
-				var seed []byte
-
-				newRoundNumber, seed, _, headBlock, err = e.readHead(chain, nil)
-				if err != nil {
-					e.logger.Info("RRR tick - node startup - failed to readHead", "err", err)
-					// Stick in starting until we see a block or successfully read the local chain
-					// roundState = RoundStateNodeStarting
-					continue
-				}
-
-				e.logger.Debug("RRR node startup - initialised from local current block")
-
-				roundRand = rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seed))))
-				roundNumber.Add(newRoundNumber, bigOne)
+				// it gets incremented below, which is correct as if we get
+				// here, then the network has failed one attempt as far as this
+				// node is concerned.
 				failedAttempts = 0
 
-				// The order is determined by age, which is determined by the last
-				// block number minted or the block of enrolement - indepdenent of
-				// how many attempts the leader needed to produce a new block
-				// last round.
-				if err := e.accumulateActive(chain, headBlock.Header()); err != nil {
-					e.logger.Info(
-						"RRR tick - node startup - accumulateActive failed", "err", err)
-					roundState = RoundStateInactive
+				roundNumber, roundRand, err = e.nextRound(chain, nil, roundNumber)
+				if err != nil {
+					roundState = RoundStateNeedBlock
+					e.logger.Warn(
+						"RRR tick - nextRound > RoundStateNeedBlock - corruption or bug ?", "err", err)
 					continue
 				}
 
-				// The next call to accumulateActive will process Ta worth of blocks
-			}
+				// End of confirmation phase. If we are a leader and we have the
+				// necessary endorsements, seal our intent.
 
-			// End of confirmation phase. If we are a leader and we have the
-			// necessary endorsements, seal our intent.
+				// engine RoundStateNodeStarting is now unreachable
+			case RoundStateNeedBlock:
+				// The current head block we have is no good to us, or we have
+				// an implementation bug.
+				e.logger.Warn(
+					"RRR tick - nextRound > RoundStateNeedBlock - corruption or bug ?", "err", err)
 
-			// engine RoundStateNodeStarting is now unreachable
+				continue
 
-			if roundState == RoundStateLeaderCandidate {
+			case RoundStateLeaderCandidate:
 
 				if confirmed, err = e.sealCurrentBlock(); confirmed {
 
@@ -432,6 +416,8 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				} else if err != nil {
 					e.logger.Warn("RRR tick - sealCurrentBlock", "err", err)
 				}
+			case RoundStateInactive:
+				e.logger.Debug("RRR tick - inactive for last attempt")
 			}
 
 			// We always increment failedAttempts if we reach here. This is the
@@ -779,6 +765,59 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 	// XXX: TODO decide if legitimate leader candidate and if in correct phase
 
 	return true, nil
+}
+
+// The roundNumber is always correct, even on err. If err is nil it will be the
+// *next* round number, otherwise it will be the round provided by the caller.
+func (e *engine) nextRound(chain RRRChainReader, head *types.Block, roundNumber *big.Int) (
+	*big.Int, // newRoundNumber
+	*rand.Rand, // and seeded deterministic random source
+	error,
+) {
+	newRoundNumber, roundSeed, _, headBlock, err := e.readHead(chain, head)
+	if err != nil {
+		e.logger.Info("RRR nextRound - failed to readHead", "err", err)
+		return roundNumber, nil, err
+	}
+
+	roundRand := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(roundSeed))))
+
+	bigDiffTmp := big.NewInt(0)
+
+	if bigDiffTmp.Sub(newRoundNumber, roundNumber).Cmp(bigOne) > 0 {
+		e.logger.Info(
+			"RRR nextRound - skipping round", "cur", roundNumber, "new", newRoundNumber)
+	} else if bigDiffTmp.Cmp(big0) < 0 {
+		e.logger.Info(
+			"RRR nextRound - round moving backwards", "cur", roundNumber, "new", newRoundNumber)
+	}
+
+	// Establish the order of identities in the round robin selection. Age is
+	// determined based on the identity enrolments in the block, and of the
+	// identities which enroled blocks - both of which are entirely independent
+	// of the number of attempts required to produce a block in any given
+	// round.
+	if err := e.accumulateActive(chain, headBlock.Header()); err != nil {
+		if !errors.Is(err, errBranchDetected) {
+			e.logger.Info(
+				"RRR nextRound - accumulateActive failed", "err", err)
+			return nil, nil, err
+		}
+
+		if err = e.resetActive(chain); err != nil {
+			e.logger.Warn("RRR nextRound resetActive failed", "err", err)
+			return nil, nil, err
+		}
+
+		if err := e.accumulateActive(chain, headBlock.Header()); err != nil {
+			e.logger.Warn("resetActive failed to recover from re-org", "err", err)
+			return roundNumber, nil, err
+		}
+	}
+	roundNumber.Set(newRoundNumber)
+	roundNumber.Add(roundNumber, bigOne)
+
+	return roundNumber, roundRand, nil
 }
 
 func (e *engine) readHead(chain RRRChainReader, head *types.Block) (

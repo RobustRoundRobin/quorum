@@ -22,7 +22,7 @@ type Config struct {
 	Candidates uint64 `toml:",omitempty"` // Number of leader candidates (Nc) to propose from the oldest identities on each round
 	Endorsers  uint64 `toml:",omitempty"` // Number of endorsers (Ne) to select from the most recently active identities
 	Quorum     uint64 `toml:",omitempty"` // Number of endorsments required to confirm an intent
-	Activity   uint64 `toml:",omitempty"` // Activity threshold (Ta). Any identity with confirmation messages recorded within this many rounds of the head are considered active.
+	Activity   uint64 `toml:",omitempty"` // Activity threshold (Ta) (in blocks). Any identity with confirmation messages recorded within this many rounds of the head are considered active.
 }
 
 // DefaultConfig provides the default rrr consensus configuration
@@ -32,5 +32,5 @@ var DefaultConfig = &Config{
 	Candidates:   5,
 	Endorsers:    100,
 	Quorum:       54,
-	Activity:     20000,
+	Activity:     200,
 }

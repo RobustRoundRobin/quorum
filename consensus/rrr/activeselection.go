@@ -21,7 +21,7 @@ var (
 	errGensisIdentityNotEnroled   = errors.New("the identity that attested the gensis block is not enrolled in the genesis block")
 	errEnrolmentNotSignedBySealer = errors.New("identity enrolment was not indidualy signed by the block sealer")
 	errEnrolmentIsKnown           = errors.New("new identity (not flagged for re-enrolment) is known")
-	errBranchDetected             = errors.New("branch detected and we haven't implemented select branch")
+	errBranchDetected             = errors.New("branch detected")
 	errInsuficientActiveIdents    = errors.New("not enough active identities found")
 	big0                          = big.NewInt(0)
 	zeroAddr                      = Address{}
@@ -87,6 +87,17 @@ func (a *idActivity) lastActiveBlock() *big.Int {
 		return a.endorsedBlock
 	}
 	return a.ageBlock
+}
+
+func (e *engine) resetActive(chain RRRChainReader) error {
+	// It feels wrong to lean this much on garbage collection. But lets see how
+	// it goes.
+	e.idlePool = make(map[Address]*idActivity)
+	e.aged = make(map[Address]*list.Element)
+	e.lastBlockSeen = Hash{}
+	e.activeBlockFence = nil
+	e.activeSelection = nil
+	return e.primeActivitySelection(chain)
 }
 
 func (e *engine) primeActivitySelection(chain RRRChainReader) error {
@@ -293,6 +304,8 @@ func (e *engine) refreshAge(
 		// If the last block we saw for this identity is older, we need to
 		// reset the age by moving it after the fence. Otherwise, we assume we
 		// have already processed it and it is in the appropriate place.
+		// But note if we have a re-org, ageBlock *can* be from the 'other'
+		// branch and so > head. The aged pool needs to be re-set for a re-org.
 		if aged.ageBlock.Cmp(blockNumber) <= 0 {
 
 			e.logger.Trace("RRR refreshAge - move",
@@ -397,7 +410,6 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 	// list in descending age order back -> front (see the spec for a less
 	// dense description) Note the sealer is considered older than all of the
 	// identities it enrolls.
-	var reorgMoandedOnce bool
 	for {
 
 		h := Hash(cur.Hash())
@@ -418,18 +430,18 @@ func (e *engine) accumulateActive(chain RRRChainReader, head *types.Header) erro
 			break
 		}
 
-		// Now we look at the activeBlockFence. If the number is at or beyond the
-		// fence and we haven't matched the hash yet it means we have
-		// inconsistent results. The exception accommodates the first pass after
-		// node startup.
-		if !reorgMoandedOnce && e.lastBlockSeen != zeroHash && cur.Number.Cmp(e.activeBlockFence) <= 0 && head.Number.Cmp(big0) != 0 {
-			// return fmt.Errorf("reached a lower block without matching hash of last seen: %w", errBranchDetected)
-			e.logger.Warn(
-				"reached a lower block without matching hash of last seen, re-setting active selection",
-				"bn", head.Number, "#", head.Hash())
-			// provided verifyHeader is working, this is fine and just a normal
-			// chain re-org
-			reorgMoandedOnce = true
+		// Now we look at the activeBlockFence. If the number is at or beyond
+		// the fence and we haven't matched the hash yet it means we have a
+		// chain re-org. The exception accommodates the first pass after node
+		// startup.
+		if e.lastBlockSeen != zeroHash && cur.Number.Cmp(e.activeBlockFence) <= 0 && head.Number.Cmp(big0) != 0 {
+			// re-orgs are fine provided verifyBranch is working, but we can't
+			// deal with them sensibly here. The expectation is that everything
+			// in aged gets moved to idles then we re-run accumulateActive to
+			// re-order the whole list.
+			return fmt.Errorf(
+				"reached a lower block without matching hash of last seen, head-bn=%v, head-#=%s: %w", head.Number, head.Hash(),
+				errBranchDetected)
 		}
 
 		confirms, enrols, sealerID, sealerPub, err := e.decodeActivity(cur)
@@ -508,6 +520,9 @@ func (e *engine) leaderForRoundAttempt(
 	iFirstLeader, iLastLeader := e.calcLeaderWindow(nActive, failedAttempts)
 
 	if iFirstLeader >= uint64(e.activeSelection.Len()) {
+		e.logger.Trace(
+			"RRR leaderForRoundAttempt - if out of range",
+			"if", iFirstLeader, "len", e.activeSelection.Len())
 		return false
 	}
 
@@ -528,14 +543,17 @@ func (e *engine) calcLeaderWindow(
 ) (uint64, uint64) {
 
 	// a = active mod  [ MAX (n active, Nc + Ne) ]
+	na := float64(nActive)
 	nc, ne := float64(e.config.Candidates), float64(e.config.Endorsers)
-	max := math.Max(float64(nActive), nc+ne)
+	max := math.Max(na, nc+ne)
 	a, _ := math.Modf(math.Mod(float64(failedAttempts), max))
 
 	iFirstLeader := uint64(math.Floor(a/nc) * nc)
 	iLastLeader := iFirstLeader + e.config.Candidates - 1
+
 	e.logger.Trace(
-		"RRR calcLeaderWindow", "f", failedAttempts, "if", iFirstLeader, "a", a, "max", max)
+		"RRR calcLeaderWindow", "na", na, "f", failedAttempts, "nc+ne", nc+ne,
+		"max", max, "a", a, "if", iFirstLeader)
 	return iFirstLeader, iLastLeader
 }
 
@@ -578,6 +596,9 @@ func (e *engine) selectCandidatesAndEndorsers(
 	}
 
 	iFirstLeader, iLastLeader := e.calcLeaderWindow(nActive, failedAttempts)
+	e.logger.Trace(
+		"RRR selectCandEs", "na", nActive, "agelen", len(e.aged),
+		"f", failedAttempts, "if", iFirstLeader, "self", e.nodeID.Hex())
 
 	candidates := make(map[common.Address]bool)
 	endorsers := make(map[common.Address]bool)
@@ -585,8 +606,6 @@ func (e *engine) selectCandidatesAndEndorsers(
 	selection := make([]common.Address, 0, e.config.Candidates+e.config.Endorsers)
 
 	var next *list.Element
-	e.logger.Trace(
-		"RRR selectCandEs", "agelen", len(e.aged), "f", failedAttempts, "if", iFirstLeader)
 
 	// The permutation is limited to active endorser candidate positions. The
 	// leader candidates don't consume 'positions'
