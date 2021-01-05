@@ -673,7 +673,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 
 			e.logger.Debug(
 				"RRR selectCandEs - select",
-				"cand", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.order, age.ageBlock),
+				"cand", fmt.Sprintf("%s:%02d.%05d", addr.Hex(), age.genesisOrder, age.ageBlock),
 				"ic", len(candidates)-1, "a", lastActive)
 			continue
 			// Note: divergence (1) leader candidates can not be endorsers

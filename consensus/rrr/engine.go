@@ -165,11 +165,6 @@ type engine struct {
 	// from the oldest candidate.
 	signedIntent *engSignedIntent
 
-	// If we have seen an intent from the oldest candidate we will have sent
-	// the endorsement imediately, and we need this flag to remember we did
-	// that.
-	sentEndorsement bool
-
 	// activeSelection  is maintained in identity age order - with the youngest at
 	// the front.
 	activeSelection *list.List                // list of *idActive

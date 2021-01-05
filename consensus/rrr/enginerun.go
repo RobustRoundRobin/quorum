@@ -353,9 +353,6 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 					e.signedIntent = nil
 				}
 
-				// sentEndorsement indicates if the endorsement was sent by
-				// handleIntent. We reset it here.
-				e.sentEndorsement = false
 				e.logger.Debug(
 					"RRR tick - RoundPhaseIntent > RoundPhaseConfirm", "r", roundNumber, "f", failedAttempts)
 				roundTick.Reset(confirmPhaseDuration)
@@ -518,29 +515,6 @@ func (e *engine) handleIntent(et *engSignedIntent, roundNumber *big.Int) error {
 		return errNotLeaderCandidate
 	}
 
-	if e.sentEndorsement {
-		// We could do this check earlier, but it is useful, at least for now,
-		// to get logs for any malformed  or late intents on all nodes that see
-		// them.
-		e.logger.Info("RRR handleIntent - endorsed oldest already, ignoring intent from", "addr", intenderAddr.Hex())
-		return nil
-	}
-
-	// If we see an intent from the oldest candidate, send the endorsement
-	// immediately.
-	if intenderAddr == Address(e.selection[0]) { // its a programming error if this slice is empty
-
-		e.logger.Info("RRR handleIntent - sending endorsment, have intent from oldest", "addr", intenderAddr.Hex())
-		err = e.sendSignedEndorsement(intenderAddr, et)
-		if err != nil {
-			e.logger.Info("RRR handleIntent - sendSignedEndorsement", "err", err)
-			return err
-		}
-		e.sentEndorsement = true
-		// If we have seen a younger candidate first, forget it.
-		e.signedIntent = nil
-	}
-
 	if e.signedIntent != nil {
 		// It must be in the map if it was active, otherwise we have a
 		// programming error.
@@ -628,15 +602,6 @@ func (e *engine) handleEndorsement(et *engSignedEndorsement) error {
 		return nil
 	}
 
-	// Endorsements is a slice whose backing array is pre allocated to the
-	// quorum size
-	if uint64(len(e.intent.Endorsements)) >= e.config.Quorum {
-		e.logger.Info("RRR confirmation redundant, have quorum",
-			"endid", et.Endorsement.EndorserID.Hex(), "end#", et.SignedEndorsement.IntentHash.Hex(),
-			"hintent", et.SignedEndorsement.IntentHash.Hex())
-		return nil
-	}
-
 	// Check the confirmation came from an endorser selected by this node for
 	// the current round
 	endorserAddr := common.Address(et.SignedEndorsement.EndorserID.Address())
@@ -656,6 +621,12 @@ func (e *engine) handleEndorsement(et *engSignedEndorsement) error {
 	// the runningCh
 	e.intent.Endorsements = append(e.intent.Endorsements, &et.SignedEndorsement)
 	e.intent.Endorsers[endorserAddr] = true
+
+	if uint64(len(e.intent.Endorsements)) >= e.config.Quorum {
+		e.logger.Info("RRR confirmation redundant, have quorum",
+			"endid", et.Endorsement.EndorserID.Hex(), "end#", et.SignedEndorsement.IntentHash.Hex(),
+			"hintent", et.SignedEndorsement.IntentHash.Hex())
+	}
 
 	return nil
 }
@@ -757,6 +728,7 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 	e.logger.Info(
 		"RRR sealCurrentBlock - sealed header",
 		"bn", block.Number(), "r", e.intent.SI.Intent.RoundNumber,
+		"ends", len(data.Confirm),
 		"#", block.Hash(), "addr", e.nodeAddr.Hex())
 
 	e.sealTask = nil
@@ -875,7 +847,6 @@ func (e *engine) nextRoundState(
 	defer e.intentMu.Unlock()
 
 	e.signedIntent = nil
-	e.sentEndorsement = false
 
 	// If we are a leader candidate we need to broadcast an intent.
 	var err error
