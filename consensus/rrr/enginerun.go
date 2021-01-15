@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"math/rand"
 	"time"
@@ -119,6 +120,41 @@ const (
 	RoundPhaseConfirm
 )
 
+func (e *engine) roundPhaseAdjustment(
+	intentDuration, confirmDuration time.Duration,
+	now, sealTime time.Time) (
+	RoundPhase, time.Duration) {
+
+	if now.After(sealTime) {
+		latency := now.Sub(sealTime)
+
+		if latency >= intentDuration+confirmDuration {
+			// We don't adjust our local attempt counter, we just align best we
+			// can with the phase.
+			m := math.Mod(float64(latency), float64(intentDuration+confirmDuration))
+			i, _ := math.Modf(m)
+			latency = time.Duration(i)
+		}
+		if latency < intentDuration {
+			// Easy case, the adjustment just shortens the intent phase.
+			return RoundPhaseIntent, intentDuration - latency
+		}
+
+		if latency < intentDuration+confirmDuration {
+			// Also fairly easy case. The adjustment puts us in the confirm
+			// phase
+			latency -= intentDuration
+			return RoundPhaseIntent, confirmDuration - latency
+		}
+		panic("this should be impossible")
+		// Now we need to consider adjusting the attempt
+	}
+
+	e.logger.Warn("seal time ahead of node now", "now", now, "seal", sealTime)
+
+	return RoundPhaseIntent, time.Duration(0)
+}
+
 func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 
 	defer e.runningWG.Done()
@@ -154,7 +190,6 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				e.logger.Info("RRR newHead - chain head channel shutdown")
 				return
 			}
-			e.logger.Debug("RRR newHead", "hash", newHead.Block.Hash().Hex())
 
 			// To get here, VerifyHeader and VerifySeal must have seen and
 			// accepted the block. We can only get a 'bad' block here if the
@@ -173,15 +208,24 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			if !roundTick.Stop() { // Stop and drain
 				<-roundTick.C
 			}
-			roundTick.Reset(intentPhaseDuration)
-			roundPhase = RoundPhaseIntent
+			// roundTick.Reset(intentPhaseDuration)
+			// roundPhase = RoundPhaseIntent
 
-			roundNumber, roundRand, err = e.nextRound(chain, newHead.Block, roundNumber)
+			var sed *SignedExtraData
+			roundNumber, roundRand, sed, err = e.nextRound(chain, newHead.Block, roundNumber)
 			if err != nil {
 				roundState = RoundStateNeedBlock
 				e.logger.Warn("RRR newHead > RoundStateNeedBlock - corruption or bug ?", "err", err)
 				continue
 			}
+
+			// XXX: Make this configurable on/off
+
+			var tick time.Duration
+			roundPhase, tick = e.roundPhaseAdjustment(
+				intentPhaseDuration, confirmPhaseDuration, time.Now(),
+				time.Unix(int64(sed.SealTime), 0))
+			roundTick.Reset(tick)
 
 			failedAttempts = 0
 			roundState, endorsers, err = e.nextRoundState(chain, roundRand, failedAttempts)
@@ -251,6 +295,15 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				// Note: we don't reset the attempt if we get a new seal task.
 				if err := e.newSealTask(roundState, et, roundNumber, failedAttempts); err != nil {
 					e.logger.Info("RRR engSealTask - newSealTask", "err", err)
+				}
+
+				if roundState == RoundStateLeaderCandidate && roundPhase == RoundPhaseIntent {
+
+					e.logger.Trace(
+						"RRR engSealTask - broadcasting intent (new)", "addr", e.nodeAddr.Hex(),
+						"r", roundNumber, "f", failedAttempts)
+
+					e.broadcastCurrentIntent(endorsers)
 				}
 
 			case *engSignedIntent:
@@ -383,7 +436,7 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				// node is concerned.
 				failedAttempts = 0
 
-				roundNumber, roundRand, err = e.nextRound(chain, nil, roundNumber)
+				roundNumber, roundRand, _, err = e.nextRound(chain, nil, roundNumber)
 				if err != nil {
 					roundState = RoundStateNeedBlock
 					e.logger.Warn(
@@ -707,9 +760,10 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 
 	data := &SignedExtraData{
 		ExtraData: ExtraData{
-			Intent:  e.intent.SI.Intent,
-			Confirm: make([]Endorsement, len(e.intent.Endorsements)),
-			Seed:    seed,
+			SealTime: uint64(time.Now().Unix()),
+			Intent:   e.intent.SI.Intent,
+			Confirm:  make([]Endorsement, len(e.intent.Endorsements)),
+			Seed:     seed,
 		},
 		// XXX: TODO seed proof / VRF's
 	}
@@ -727,6 +781,7 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 	e.sealTask.Results <- block
 	e.logger.Info(
 		"RRR sealCurrentBlock - sealed header",
+		"now", time.Now(), "bt", header.Time,
 		"bn", block.Number(), "r", e.intent.SI.Intent.RoundNumber,
 		"ends", len(data.Confirm),
 		"#", block.Hash(), "addr", e.nodeAddr.Hex())
@@ -744,12 +799,27 @@ func (e *engine) sealCurrentBlock() (bool, error) {
 func (e *engine) nextRound(chain RRRChainReader, head *types.Block, roundNumber *big.Int) (
 	*big.Int, // newRoundNumber
 	*rand.Rand, // and seeded deterministic random source
+	*SignedExtraData,
 	error,
 ) {
-	newRoundNumber, roundSeed, _, headBlock, err := e.readHead(chain, head)
+	newRoundNumber, roundSeed, sed, headBlock, err := e.readHead(chain, head)
 	if err != nil {
 		e.logger.Info("RRR nextRound - failed to readHead", "err", err)
-		return roundNumber, nil, err
+		return roundNumber, nil, nil, err
+	}
+	if head != nil {
+		// Its a block from the network.
+		tbloc := time.Unix(int64(head.Header().Time), 0)
+		tseal := time.Unix(int64(sed.SealTime), 0)
+		tnow := time.Now()
+
+		e.logger.Debug(
+			"RRR nextRound - new block",
+			"bn", roundNumber,
+			"l1", tnow.Sub(tseal).Milliseconds(),
+			"l2", tnow.Sub(tbloc).Milliseconds(),
+			"f", sed.Intent.FailedAttempts,
+			"hash", head.Hash().Hex())
 	}
 
 	roundRand := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(roundSeed))))
@@ -773,23 +843,23 @@ func (e *engine) nextRound(chain RRRChainReader, head *types.Block, roundNumber 
 		if !errors.Is(err, errBranchDetected) {
 			e.logger.Info(
 				"RRR nextRound - accumulateActive failed", "err", err)
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		if err = e.resetActive(chain); err != nil {
 			e.logger.Warn("RRR nextRound resetActive failed", "err", err)
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		if err := e.accumulateActive(chain, headBlock.Header()); err != nil {
 			e.logger.Warn("resetActive failed to recover from re-org", "err", err)
-			return roundNumber, nil, err
+			return roundNumber, nil, nil, err
 		}
 	}
 	roundNumber.Set(newRoundNumber)
 	roundNumber.Add(roundNumber, bigOne)
 
-	return roundNumber, roundRand, nil
+	return roundNumber, roundRand, sed, nil
 }
 
 func (e *engine) readHead(chain RRRChainReader, head *types.Block) (
@@ -889,23 +959,8 @@ func (e *engine) newSealTask(
 		return err
 	}
 
-	if state == RoundStateLeaderCandidate {
-
-		// We are a leader candidate, if there is an intent it will have been
-		// published. If there isn't one, we have missed our chance to publish
-		// an intent this attempt. In either case, we defer until the end of
-		// the attempt.
-
-		e.nextIntent = newIntent
-		e.nextSealTask = et
-
-		e.logger.Trace("RRR newSealTask - deferred", "hseal", newIntent.SealHash.Hex())
-	} else {
-		e.nextIntent = nil
-		e.nextSealTask = nil
-		e.intent = newIntent
-		e.sealTask = et
-	}
+	e.intent = newIntent
+	e.sealTask = et
 	return nil
 }
 
@@ -919,13 +974,6 @@ func (e *engine) refreshSealTask(roundNumber *big.Int, failedAttempts uint) erro
 	defer e.intentMu.Unlock()
 
 	// Establish which, if any, currently known task can be refreshed.
-
-	if e.nextSealTask != nil {
-		e.sealTask = e.nextSealTask
-		e.intent = e.nextIntent
-		e.nextSealTask = nil
-		e.nextIntent = nil
-	}
 
 	// Reconcile whether to re-issue current seal task
 	if e.sealTask == nil || e.sealTask.Canceled() {

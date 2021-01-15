@@ -7,11 +7,14 @@ import (
 )
 
 type ExtraData struct {
-	Intent  Intent
-	Confirm []Endorsement
-	Enrol   []Enrolment
-	Seed    []byte // generated using crypto/rand for now
-	Proof   []byte // Not meaningful until we add VRF support
+	// SealTime is not part of the protocol. It is used for reporting
+	// disemination latencey. It is the unix time on the sealers system.
+	SealTime uint64
+	Intent   Intent
+	Confirm  []Endorsement
+	Enrol    []Enrolment
+	Seed     []byte // generated using crypto/rand for now
+	Proof    []byte // Not meaningful until we add VRF support
 }
 
 type SignedExtraData struct {
