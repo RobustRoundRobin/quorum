@@ -73,72 +73,14 @@ type pendingIntent struct {
 	Endorsers map[common.Address]bool
 }
 
-type RoundState int // todo: rename -> RoundRole
-type RoundPhase int
-
-const (
-	RoundStateInvalid RoundState = iota
-	// If beginBlock fails we can't recover without a new block - this state suggests a bug in verifyHeader
-	RoundStateNeedBlock
-	RoundStateInactive          // Indicates conditions we expect to be transitor - endorsers not online etc
-	RoundStateNodeStarting      // Node has just started up, wait long enough to allow for a block to be minted by live participants
-	RoundStateActive            // Has endorsed or mined in some time in the last Ta rounds.
-	RoundStateLeaderCandidate   // Selected as leader candidate for current round
-	RoundStateEndorserCommittee // Is in the endorser committee for the current round.
-)
-
-func (p RoundPhase) String() string {
-	switch p {
-	case RoundPhaseIntent:
-		return "RoundPhaseIntent"
-	case RoundPhaseConfirm:
-		return "RoundPhaseConfirm"
-	default:
-		return "RoundPhaseInvalid"
-	}
-}
-
-func (s RoundState) String() string {
-	switch s {
-	case RoundStateNeedBlock:
-		return "RoundStateNeedBlock"
-	case RoundStateInvalid:
-		return "RoundStateInvalid"
-	case RoundStateInactive:
-		return "RoundStateInactive"
-	case RoundStateNodeStarting:
-		return "RoundStateNodeStarting"
-	case RoundStateActive:
-		return "RoundStateActive"
-	case RoundStateLeaderCandidate:
-		return "RoundStateLeaderCandidate"
-	case RoundStateEndorserCommittee:
-		return "RoundStateEndorserCommittee"
-	default:
-		return "<unknown>"
-	}
-}
-
-const (
-	RoundPhaseInvalid RoundPhase = iota
-	// During the Intent phase, the endorser committee is allowing for intents
-	// to arrive so they can, with high probability,  pick the oldest active
-	// leader candidate.
-	RoundPhaseIntent
-	// During the confirmation phase leaders are waiting for all the
-	// endorsements to come in so they fairly represent activity.
-	RoundPhaseConfirm
-)
-
 func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 
 	defer e.runningWG.Done()
 	e.runningWG.Add(1)
 
-	t := NewRoundTime(e.config.RoundLength, e.config.ConfirmPhase, e.logger)
-	t.Start()
+	r := NewRoundState(e.config, e.logger)
+	r.Start()
 
-	roundPhase := RoundPhaseIntent
 	// Endorsed leader candidates will broadcast the new block at the end of
 	// the round according to their tickers. We reset the ticker each time we
 	// see a new block confirmed. This will cause all participants to loosely
@@ -146,15 +88,6 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 	// sufficient endorsments to produce a block, each leader candidate will
 	// simply re-broadcast their current intent.
 
-	var roundRand *rand.Rand
-
-	roundState := RoundStateNodeStarting
-	roundNumber := big.NewInt(1) // default block is the first after genesis
-
-	failedAttempts := uint(0)
-	var endorsers map[common.Address]consensus.Peer
-
-	var err error
 	for {
 		select {
 		case newHead, ok := <-e.chainHeadCh:
@@ -162,71 +95,7 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 				e.logger.Info("RRR newHead - chain head channel shutdown")
 				return
 			}
-
-			// To get here, VerifyHeader and VerifySeal must have seen and
-			// accepted the block. We can only get a 'bad' block here if the
-			// consensus interface is not being honoured.
-
-			// Reset the timer when a new block arrives. This should offer lose
-			// synchronisation.  RRR's notion of active and age requires that
-			// honest nodes give endorsers a consistent amount of time per
-			// round to record their endorsement by signing an intent for the
-			// leader. Whether or not the endorsement was required to reach the
-			// quorum, the presence of the endorsement in the block header is
-			// how RRR determines if non leader nodes are active in a
-			// particular round. Note that go timers are quite tricky, see
-			// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
-			t.Stop()
-
-			// t.ResetForIntentPhase()
-			// roundPhase = RoundPhaseIntent
-
-			var sed *SignedExtraData
-			roundNumber, roundRand, sed, err = e.nextRound(chain, newHead.Block, roundNumber)
-			if err != nil {
-				roundState = RoundStateNeedBlock
-				e.logger.Warn("RRR newHead > RoundStateNeedBlock - corruption or bug ?", "err", err)
-				continue
-			}
-
-			// XXX: Make this configurable on/off
-			roundPhase = t.PhaseAdjust(sed.SealTime)
-
-			failedAttempts = 0
-			roundState, endorsers, err = e.nextRoundState(chain, roundRand, failedAttempts)
-			if err != nil {
-				e.logger.Info("RRR newHead - nextRoundState", "err", err)
-			}
-
-			e.logger.Info(
-				fmt.Sprintf("RRR new round *** %s ***", roundState.String()),
-				"round", roundNumber, "phase", roundPhase.String(), "addr", e.nodeAddr.Hex())
-
-			if roundState != RoundStateLeaderCandidate {
-				continue
-			}
-
-			if len(endorsers) < int(e.config.Quorum) {
-				e.logger.Debug(
-					"RRR *** insufficient endorsers online ***", "round", roundNumber,
-					"addr", e.nodeAddr.Hex(), "err", err)
-			}
-
-			// The intent is cleared when the round changes. Here we know we
-			// are a leader candidate on the new round, establish our new
-			// intent.
-
-			// If there is a current seal task, it will be resused, no matter
-			// how long it has been since the local node was a leader
-			// candidate.
-			if err := e.refreshSealTask(roundNumber, failedAttempts); err != nil {
-				e.logger.Info("RRR newHead refreshSealTask", "err", err)
-				continue
-			}
-
-			// Make our peers aware of our intent for this round, this may get
-			// reset by the arival of a new sealing task
-			e.broadcastCurrentIntent(endorsers)
+			r.NewChainHead(e, chain, newHead.Block)
 
 		case i, ok := <-ch:
 			if !ok {
@@ -238,226 +107,23 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 
 			case *engSealTask:
 
-				// We always accept seal tasks, we just don't do anything with
-				// them unless we become a leader while it is outstanding.
-				e.logger.Trace("RRR engSealTask",
-					"state", roundState.String(), "addr", e.nodeAddr.Hex(),
-					"r", roundNumber, "f", failedAttempts)
-
-				et.RoundNumber = big.NewInt(0).Set(roundNumber)
-
-				// Note: we don't reset the attempt if we get a new seal task.
-				if err := e.newSealTask(roundState, et, roundNumber, failedAttempts); err != nil {
-					e.logger.Info("RRR engSealTask - newSealTask", "err", err)
-				}
-
-				if roundState == RoundStateLeaderCandidate && roundPhase == RoundPhaseIntent {
-
-					e.logger.Trace(
-						"RRR engSealTask - broadcasting intent (new)", "addr", e.nodeAddr.Hex(),
-						"r", roundNumber, "f", failedAttempts)
-
-					e.broadcastCurrentIntent(endorsers)
-				}
+				r.NewSealTask(e, et)
 
 			case *engSignedIntent:
 
-				// endorser <- intent from leader candidate
-				if roundState == RoundStateNodeStarting {
-					e.logger.Trace("RRR engSignedIntent - node starting, ignoring", "et.round", et.RoundNumber)
-					continue
-				}
-				if roundState == RoundStateNeedBlock {
-					e.logger.Trace("RRR engSignedIntent - need block, ignoring", "et.round", et.RoundNumber)
-					continue
-				}
-				// See RRR-spec.md for a more thorough explanation, and for why
-				// we don't check the round phase or whether or not we -
-				// locally - have selected ourselves as an endorser.
-				// handleIntent.
-				e.logger.Trace("RRR run got engSignedIntent",
-					"round", roundNumber, "cand-round", et.RoundNumber, "cand-attempts", et.FailedAttempts,
-					"candidate", et.NodeID.Hex(), "parent", et.ParentHash.Hex())
-
-				if err := e.handleIntent(et, roundNumber); err != nil {
-					e.logger.Info("RRR run handleIntent", "err", err)
-				}
+				r.NewSignedIntent(e, et)
 
 			case *engSignedEndorsement:
 
-				// leader <- endorsment from committee
-				if roundState == RoundStateNodeStarting {
-					e.logger.Trace("RRR engSignedEndorsement - node starting, ignoring", "end", et.EndorserID.Hex())
-					continue
-				}
-
-				if roundState != RoundStateLeaderCandidate {
-					// This is un-expected. Likely late, or possibly from
-					// broken node
-					e.logger.Trace("RRR non-leader ignoring engSignedEndorsement", "round", roundNumber)
-					continue
-				}
-
-				// XXX: divergence (3) the paper handles endorsements only in
-				// the confirmation phase. It is important that all identities
-				// get an opportunity to record activity. I think the key point
-				// is that a quorum of fast nodes can't starve 'slow' nodes. So
-				// as long as the window is consistent for all, it doesn't
-				// really matter what it is. And it is (a little) easier to
-				// just accept endorsements at any time in the round.
-
-				e.logger.Trace("RRR engSignedEndorsement",
-					"round", roundNumber,
-					"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
-
-				// Provided the endorsment is for our outstanding intent and
-				// from an identity we have selected as an endorser in this
-				// round, then its endorsment will be included in the block -
-				// whether we needed it to reach the endorsment quorum or not.
-				if err := e.handleEndorsement(et); err != nil {
-					e.logger.Info("RRR run handleIntent", "err", err)
-				}
+				r.NewSignedEndorsement(e, et)
 
 			default:
 				e.logger.Info("rrr engine.run received unknown type", "v", i)
 			}
 
-		case <-t.Ticker.C:
-			var confirmed bool
-			var err error
+		case <-r.T.Ticker.C:
 
-			// We MUST reset, else the Stop when a new block arrives will block
-			if roundPhase == RoundPhaseIntent {
-
-				// Completed intent phase, if we have a signedIntent here, it
-				// means we have not seen an intent from the oldest selected
-				// and this is the oldest we have seen. So go ahead and send
-				// it. This gives us liveness in the face of network issues and
-				// misbehaviour.  The > Nc the stronger the mitigation. Notice
-				// that we DO NOT check if we are currently selected as an
-				// endorser.
-				// XXX: TODO given what we are doing with intents, endorsements
-				// and failedAttempts now, I'm not sure having strict intent
-				// and confirmation phases makese sense - one 'attempt' phase
-				// timer should work just as well.
-
-				if roundState == RoundStateNeedBlock {
-					// If we don't have a valid head, we have no buisiness
-					// handing out endorsements
-					e.logger.Trace(
-						"RRR tick - intent phase - discarding endorsement due to round state",
-						"r", roundNumber, "f", failedAttempts, "state", roundState.String())
-
-					e.signedIntent = nil
-				}
-
-				if e.signedIntent != nil {
-					oldestSeen := e.signedIntent.NodeID.Address()
-					e.logger.Trace(
-						"RRR tick - intent phase - sending endorsement to oldest seen",
-						"r", roundNumber, "f", failedAttempts)
-					e.sendSignedEndorsement(oldestSeen, e.signedIntent)
-					e.signedIntent = nil
-				}
-
-				e.logger.Debug(
-					"RRR tick - RoundPhaseIntent > RoundPhaseConfirm", "r", roundNumber, "f", failedAttempts)
-
-				t.ResetForConfirmPhase()
-				roundPhase = RoundPhaseConfirm
-				continue
-			}
-
-			// completed confirm phase
-			roundPhase = RoundPhaseIntent
-
-			// Choosing to include the potential cost of the first call to
-			// nextRound in the ticker
-			t.ResetForIntentPhase()
-
-			// Deal with the 'old' state and any end conditions
-			switch roundState {
-			case RoundStateNodeStarting:
-				// On startup, we wait a round to see if we get a block from a
-				// currently live network. If not we assume we are the first
-				// (or among the first) nodes, to start or to catch up.
-				// Remember, the miner stops and the consensus engine while it
-				// is syncing.  If we haven't received a block from the network
-				// to pick the round from, we will use the current block
-				// according to the local database.
-
-				// it gets incremented below, which is correct as if we get
-				// here, then the network has failed one attempt as far as this
-				// node is concerned.
-				failedAttempts = 0
-
-				roundNumber, roundRand, _, err = e.nextRound(chain, nil, roundNumber)
-				if err != nil {
-					roundState = RoundStateNeedBlock
-					e.logger.Warn(
-						"RRR tick - nextRound > RoundStateNeedBlock - corruption or bug ?", "err", err)
-					continue
-				}
-
-				// End of confirmation phase. If we are a leader and we have the
-				// necessary endorsements, seal our intent.
-
-				// engine RoundStateNodeStarting is now unreachable
-			case RoundStateNeedBlock:
-				// The current head block we have is no good to us, or we have
-				// an implementation bug.
-				e.logger.Warn(
-					"RRR tick - nextRound > RoundStateNeedBlock - corruption or bug ?", "err", err)
-
-				continue
-
-			case RoundStateLeaderCandidate:
-
-				if confirmed, err = e.sealCurrentBlock(); confirmed {
-
-					e.logger.Info("RRR tick - sealed block", "addr", e.nodeAddr.Hex(),
-						"r", roundNumber, "f", failedAttempts)
-
-				} else if err != nil {
-					e.logger.Warn("RRR tick - sealCurrentBlock", "err", err)
-				}
-			case RoundStateInactive:
-				e.logger.Debug("RRR tick - inactive for last attempt")
-			}
-
-			// We always increment failedAttempts if we reach here. This is the
-			// local nodes perspective on how many times the network has failed
-			// to produce a block. failedAttempts is reset in newHead. Until
-			// we *see* a newHead, we consider the attempt failed even if we
-			// seal a block above
-			failedAttempts++
-
-			roundState, endorsers, err = e.nextRoundState(chain, roundRand, failedAttempts)
-			if err != nil {
-				e.logger.Info("RRR tick - nextRoundState", "err", err)
-			}
-			e.logger.Debug("RRR tick - RoundPhaseConfirm > RoundPhaseIntent",
-				"state", roundState.String(), "addr", e.nodeAddr.Hex(),
-				"r", roundNumber, "f", failedAttempts)
-
-			// Note: If we just sealed a block (above) then there will be
-			// no outstanding intent and refreshSealTask will be a NoOp.
-			// Ultimately, if the block we just sealed doesn't result in a
-			// NewChainHead event, we will eventually try again when the
-			// failedAttempts counter makes it our turn again. But only if a
-			// new task arives. Once we commit to a block seal, we are done
-			// with the block regardless of what the network sais about it.
-			if roundState == RoundStateLeaderCandidate {
-				if err = e.refreshSealTask(roundNumber, failedAttempts); err != nil {
-					e.logger.Debug("RRR - tick refreshSealTask", "err", err)
-				}
-
-				e.logger.Trace(
-					"RRR tick - broadcasting intent", "addr", e.nodeAddr.Hex(),
-					"r", roundNumber, "f", failedAttempts)
-
-				e.broadcastCurrentIntent(endorsers)
-			}
+			r.PhaseTick(e, chain)
 		}
 	}
 }
@@ -866,7 +532,7 @@ func (e *engine) readHead(chain RRRChainReader, head *types.Block) (
 // intent which confirmed the block. It is a programming error if sampleCount < 1
 func (e *engine) nextRoundState(
 	chain RRRChainReader, roundRand *rand.Rand, failedAttempts uint,
-) (RoundState, map[common.Address]consensus.Peer, error) {
+) (RRRState, map[common.Address]consensus.Peer, error) {
 
 	e.intentMu.Lock()
 	defer e.intentMu.Unlock()
@@ -878,7 +544,7 @@ func (e *engine) nextRoundState(
 	e.candidates, e.endorsers, e.selection, err = e.selectCandidatesAndEndorsers(
 		chain, roundRand, failedAttempts)
 	if err != nil {
-		return RoundStateInactive, nil, err
+		return RRRStateInactive, nil, err
 	}
 
 	// How many endorsing peers are online - check this regardles of
@@ -888,22 +554,22 @@ func (e *engine) nextRoundState(
 	if len(endorsers) < int(e.config.Quorum) {
 		// XXX: possibly it should be stricter and require e.config.Endorsers
 		// online
-		return RoundStateInactive, nil, nil
+		return RRRStateInactive, nil, nil
 	}
 
 	if !e.candidates[e.nodeAddr] {
 		if !e.endorsers[e.nodeAddr] {
-			return RoundStateActive, nil, nil // XXX: everyone is considered active for now
+			return RRRStateActive, nil, nil // XXX: everyone is considered active for now
 		}
-		return RoundStateEndorserCommittee, nil, nil
+		return RRRStateEndorserCommittee, nil, nil
 	}
 	e.intent = nil
 
-	return RoundStateLeaderCandidate, endorsers, nil
+	return RRRStateLeaderCandidate, endorsers, nil
 }
 
 func (e *engine) newSealTask(
-	state RoundState, et *engSealTask, roundNumber *big.Int, failedAttempts uint,
+	state RRRState, et *engSealTask, roundNumber *big.Int, failedAttempts uint,
 ) error {
 	var err error
 	e.intentMu.Lock()
