@@ -154,12 +154,6 @@ type engine struct {
 	sealTask *engSealTask
 	intent   *pendingIntent
 
-	// If we get a new seal task during our intent phase, we hold on to it
-	// until the phase is over, else we would invalidate the intent we have
-	// published. The queue only needs to be 1 deep
-	nextSealTask *engSealTask
-	nextIntent   *pendingIntent
-
 	// On endorsing nodes, keep the oldest signed intent we have seen during
 	// the intent phase, until the end of the phase or until we see an intent
 	// from the oldest candidate.

@@ -168,6 +168,7 @@ var (
 		utils.RRRCandidatesFlag,
 		utils.RRREndorsersFlag,
 		utils.RRRQuorumFlag,
+		utils.RRRActivityFlag,
 		utils.PluginSettingsFlag,
 		utils.PluginSkipVerifyFlag,
 		utils.PluginLocalVerifyFlag,

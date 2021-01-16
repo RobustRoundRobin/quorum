@@ -314,6 +314,7 @@ var AppHelpFlagGroups = []flagGroup{
 			utils.RRRCandidatesFlag,
 			utils.RRREndorsersFlag,
 			utils.RRRQuorumFlag,
+			utils.RRRActivityFlag,
 		},
 	},
 	// END QUORUM

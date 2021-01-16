@@ -900,6 +900,11 @@ var (
 		Usage: "Number of endorsers required to confirm a leaders intent",
 		Value: eth.DefaultConfig.RRR.Quorum,
 	}
+	RRRActivityFlag = cli.Uint64Flag{
+		Name:  "rrr.ta",
+		Usage: "Number of rounds (blocks) to consider for active selection",
+		Value: eth.DefaultConfig.RRR.Activity,
+	}
 )
 
 // MakeDataDir retrieves the currently requested data directory, terminating
@@ -1594,7 +1599,9 @@ func setRRR(ctx *cli.Context, cfg *eth.Config) {
 	if ctx.GlobalIsSet(RRRQuorumFlag.Name) {
 		cfg.RRR.Quorum = ctx.GlobalUint64(RRRQuorumFlag.Name)
 	}
-
+	if ctx.GlobalIsSet(RRRActivityFlag.Name) {
+		cfg.RRR.Activity = ctx.GlobalUint64(RRRActivityFlag.Name)
+	}
 }
 
 func setQuorumConfig(ctx *cli.Context, cfg *eth.Config) {

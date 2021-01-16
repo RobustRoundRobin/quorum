@@ -592,7 +592,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 	nActive := uint(e.activeSelection.Len())
 	if nActive < uint(e.config.Candidates+e.config.Quorum) {
 		return nil, nil, nil, fmt.Errorf(
-			"%v < %v(c) +%v(q):%w", nActive, e.config.Candidates, e.config.Quorum, errInsuficientActiveIdents)
+			"%v < %v(c) + %v(q):%w", nActive, e.config.Candidates, e.config.Quorum, errInsuficientActiveIdents)
 	}
 
 	iFirstLeader, iLastLeader := e.calcLeaderWindow(nActive, failedAttempts)
@@ -710,6 +710,7 @@ func (e *engine) selectCandidatesAndEndorsers(
 	}
 
 	if true {
+		// XXX: Use the lazy logger here
 		// dump a report of the selection. Can later make this configurable. By
 		// reporting as "block.order", we can, for small development networks,
 		// easily correlate with the network. We probably also want the full
@@ -741,11 +742,11 @@ func (e *engine) selectCandidatesAndEndorsers(
 				strends = append(strends, s)
 			}
 		}
-		e.logger.Info("RRR selectCandEs selected", "cans", strings.Join(strcans, ","))
-		e.logger.Info("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
+		e.logger.Debug("RRR selectCandEs selected", "cans", strings.Join(strcans, ","))
+		e.logger.Debug("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
 	}
 
-	e.logger.Info("RRR selectCandEs - iendorsers", "p", permutation)
+	e.logger.Debug("RRR selectCandEs - iendorsers", "p", permutation)
 
 	return candidates, endorsers, selection, nil
 }
