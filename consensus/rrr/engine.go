@@ -2,21 +2,19 @@ package rrr
 
 import (
 	"bytes"
-	"container/list"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
-	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
@@ -57,10 +55,16 @@ var (
 )
 
 const (
+	// NewBlockMsg this is a redfinition of the dev p2p message code from the eth
+	// protocol. Incase we need to consider blocks as they arive from the
+	// network (we don't currently)
 	NewBlockMsg = 0x07
 
+	// RRRExtraVanity is the lenght of the space BEFORE rrr's consensis data.
+	// Its the space we leave for normal node vanity.
 	RRRExtraVanity = 32
-	rrrMsg         = 0x11
+
+	rrrMsg = 0x11
 
 	// TODO: probably want this to be driven by Nc, Ne configuration
 	lruPeers    = 100 + 6*2
@@ -74,11 +78,15 @@ const (
 type RMsgCode uint
 
 const (
+	// RMsgInvalid is the *never set* invalid message code
 	RMsgInvalid RMsgCode = iota
+	// RMsgIntent identifies RRR intent messages
 	RMsgIntent
+	// RMsgConfirm identifies RRR endorsement messages (confirmations)
 	RMsgConfirm
 )
 
+// RMsg is the dev p2p (eth) message for RRR
 type RMsg struct {
 	Code RMsgCode
 	// Seq should be incremented to cause an explicit message resend. It is not
@@ -92,8 +100,7 @@ type API struct {
 	chain consensus.ChainReader
 	rrr   *engine
 }
-
-type ChainSubscriber interface {
+type chainSubscriber interface {
 	SubscribeChainEvent(ch chan<- core.ChainEvent) event.Subscription
 	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
 	SubscribeChainSideEvent(ch chan<- core.ChainSideEvent) event.Subscription
@@ -104,9 +111,23 @@ type ChainSubscriber interface {
 // import cycles on the core event types
 type RRRChainReader interface {
 	consensus.ChainReader
-	ChainSubscriber
+	chainSubscriber
 	CurrentBlock() *types.Block
 	HasBadBlock(hash common.Hash) bool
+}
+
+// eng* types can be sent at any tome the the engines runningCh.
+type engSignedIntent struct {
+	SignedIntent
+	Pub        []byte // Derived from signature
+	ReceivedAt time.Time
+	Seq        uint // from RMsg
+}
+type engSignedEndorsement struct {
+	SignedEndorsement
+	Pub        []byte // Derived from signature
+	ReceivedAt time.Time
+	Seq        uint // from RMsg
 }
 
 // engine implements consensus.Engine using Robust Round Robin consensus
@@ -119,9 +140,6 @@ type engine struct {
 	address    common.Address
 	logger     log.Logger
 	db         ethdb.Database
-	genesisEx  GenesisExtraData
-	nodeID     Hash // derived from privateKey
-	nodeAddr   common.Address
 
 	chain       consensus.ChainReader
 	broadcaster consensus.Broadcaster
@@ -150,51 +168,11 @@ type engine struct {
 	// Handles all of the  eng* types and core.ChainHeadEvent
 	runningCh chan interface{}
 
-	intentMu sync.Mutex
-	sealTask *engSealTask
-	intent   *pendingIntent
-
-	// On endorsing nodes, keep the oldest signed intent we have seen during
-	// the intent phase, until the end of the phase or until we see an intent
-	// from the oldest candidate.
-	signedIntent *engSignedIntent
-
-	// activeSelection  is maintained in identity age order - with the youngest at
-	// the front.
-	activeSelection *list.List                // list of *idActive
-	aged            map[Address]*list.Element // map of NodeID.Addresss() -> Element in active
-
-	// The idle pool tracks identities that have gone idle within Ta*2-1 blocks
-	// from head at the time the node started. The *2-1 comes from the
-	// posibilty of seeing enrolments from nodes after their last
-	// (re-)enrolment has gone behond Ta of HEAD. Additionaly, because
-	// selectActive processes the chain from HEAD -> genesis, we can encounter
-	// endorsments before we see the enrolment. To accomodate this we put 'new'
-	// identity activity into the idlePool. Then IF we encounter the enrolment
-	// within Ta of HEAD we move it to the activeSelection
-	idlePool map[Address]*idActivity
-
-	// When updating activity, we walk back from the block we are presented
-	// with. We ERROR if we reach a block number lower than activeBlockFence
-	// without matching the hash - that is a branch and we haven't implemented
-	// SelectBranch yet.
-	lastBlockSeen    Hash
-	activeBlockFence *big.Int
-
-	// These get updated each round on all nodes without regard to which are
-	// leaders/endorsers or participants.
-	selection  []common.Address // age ordered selected candidates and endorsers for the round
-	candidates map[common.Address]bool
-	endorsers  map[common.Address]bool
-	// Number of endorsers required to confirm an intent.
-	quorum int
-	// roundRand is re-seeded at the start of each round (nextRound) from the block seed
-	roundRand *rand.Rand // OWNED by the run() go-routine DO NOT USE from other threads.
-	roundSeed int64      // stored for telemetry purposes, set only in nextRound
+	r *RoundState
 }
 
 func (e *engine) HexNodeID() string {
-	return hex.EncodeToString(e.nodeID[:])
+	return hex.EncodeToString(e.r.nodeID[:])
 }
 
 func (e *engine) IsRunning() bool {
@@ -217,22 +195,161 @@ func New(config *Config, privateKey *ecdsa.PrivateKey, db ethdb.Database) consen
 	peerMessages, _ := lru.NewARC(lruPeers)
 	selfMessages, _ := lru.NewARC(lruMessages)
 	e := &engine{
-		config:           config,
-		privateKey:       privateKey,
-		nodeID:           Pub2NodeID(&privateKey.PublicKey),
-		nodeAddr:         crypto.PubkeyToAddress(privateKey.PublicKey),
-		logger:           logger,
-		db:               db,
-		chainHeadCh:      make(chan core.ChainHeadEvent),
-		peerMessages:     peerMessages,
-		selfMessages:     selfMessages,
-		aged:             make(map[Address]*list.Element),
-		idlePool:         make(map[Address]*idActivity),
-		lastBlockSeen:    Hash{},
-		activeBlockFence: nil,
+		config:       config,
+		privateKey:   privateKey,
+		logger:       logger,
+		db:           db,
+		chainHeadCh:  make(chan core.ChainHeadEvent),
+		peerMessages: peerMessages,
+		selfMessages: selfMessages,
+		r:            NewRoundState(privateKey, config, logger),
 	}
 
 	return e
+}
+
+func (e *engine) Start(
+	reader consensus.ChainReader) error {
+
+	e.logger.Debug("RRR Start")
+	e.runningMu.Lock()
+	defer e.runningMu.Unlock()
+	if e.runningCh != nil {
+		return nil
+	}
+
+	chain, ok := reader.(RRRChainReader)
+	if !ok {
+		return errIncompatibleChainReader
+	}
+
+	// IF we are starting for the first time or the active selection has been
+	// thrown away, this will re initialise it. else we are re-starting,
+	// and accumulateActive will catch up as appropriate for the new head
+	e.r.PrimeActiveSelection(chain)
+
+	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
+	e.runningCh = make(chan interface{})
+	go e.run(chain, e.runningCh)
+
+	return nil
+}
+
+func (e *engine) Stop() error {
+
+	e.logger.Debug("RRR stopping")
+
+	e.runningMu.Lock()
+
+	if e.chainHeadSub != nil {
+		e.chainHeadSub.Unsubscribe()
+	}
+
+	if e.runningCh != nil {
+
+		close(e.runningCh)
+		e.runningCh = nil
+		e.runningMu.Unlock()
+
+		e.runningWG.Wait()
+
+	} else {
+		e.runningMu.Unlock()
+	}
+	return nil
+}
+
+func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
+
+	defer e.runningWG.Done()
+	e.runningWG.Add(1)
+
+	e.r.Start()
+
+	// Endorsed leader candidates will broadcast the new block at the end of
+	// the round according to their tickers. We reset the ticker each time we
+	// see a new block confirmed. This will cause all participants to loosely
+	// align on the same time window for each round. In the absence of
+	// sufficient endorsments to produce a block, each leader candidate will
+	// simply re-broadcast their current intent.
+
+	for {
+		select {
+		case newHead, ok := <-e.chainHeadCh:
+			if !ok {
+				e.logger.Info("RRR newHead - chain head channel shutdown")
+				return
+			}
+			e.r.NewChainHead(e, chain, newHead.Block)
+
+		case i, ok := <-ch:
+			if !ok {
+				e.logger.Info("RRR run - input channel closed")
+				return
+			}
+
+			switch et := i.(type) {
+
+			case *engSealTask:
+
+				e.r.NewSealTask(e, et)
+
+			case *engSignedIntent:
+
+				e.r.NewSignedIntent(et)
+
+			case *engSignedEndorsement:
+
+				e.r.NewSignedEndorsement(et)
+
+			default:
+				e.logger.Info("rrr engine.run received unknown type", "v", i)
+			}
+
+		case <-e.r.T.Ticker.C:
+
+			e.r.PhaseTick(e, chain)
+		}
+	}
+}
+
+// SendSignedEndorsement sends a signed (endorsed) intent back to the intender
+func (e *engine) SendSignedEndorsement(intenderAddr Address, et *engSignedIntent) error {
+
+	c := &SignedEndorsement{
+		Endorsement: Endorsement{
+			ChainID:    e.r.genesisEx.ChainID,
+			EndorserID: e.r.nodeID,
+		},
+	}
+
+	var err error
+	c.IntentHash, err = et.SignedIntent.Hash()
+	if err != nil {
+		return err
+	}
+
+	// Note: by including the senders sequence, and remembering that the sender
+	// will be changing the round also, we can be sure we will reply even if
+	// the intent is otherwise a duplicate.
+	rmsg := &RMsg{Code: RMsgConfirm, Seq: et.Seq}
+	rmsg.Raw, err = c.SignedEncode(e.privateKey)
+	if err != nil {
+		e.logger.Info("RRR encoding SignedEndorsement", "err", err.Error())
+		return err
+	}
+	msg, err := rlp.EncodeToBytes(rmsg)
+	if err != nil {
+		e.logger.Info("RRR encoding RMsgConfirm", "err", err.Error())
+		return err
+	}
+
+	e.logger.Debug("RRR sending confirmation",
+		"candidate", et.SignedIntent.NodeID.Hex(),
+		"endorser", e.r.nodeID.Hex())
+
+	// find the peer candidate
+	return e.Send(common.Address(intenderAddr), msg)
 }
 
 // NewBlockChain is ignored, we subscribe to the original ChainHeadEvent
@@ -314,6 +431,12 @@ func (e *engine) HandleMsg(peerAddr common.Address, data p2p.Msg) (bool, error) 
 	default:
 		return true, errRMsgInvalidCode
 	}
+}
+
+func (e *engine) FindPeers(
+	peers map[common.Address]bool) map[common.Address]consensus.Peer {
+
+	return e.broadcaster.FindPeers(peers)
 }
 
 // Send the message to the peer - if its hash is not in the ARU cache for the
@@ -426,74 +549,20 @@ func (e *engine) postIfRunning(i interface{}) bool {
 	return true
 }
 
-func (e *engine) Start(
-	reader consensus.ChainReader) error {
-
-	e.logger.Debug("RRR Start")
-	e.runningMu.Lock()
-	defer e.runningMu.Unlock()
-	if e.runningCh != nil {
-		return nil
-	}
-
-	chain, ok := reader.(RRRChainReader)
-	if !ok {
-		return errIncompatibleChainReader
-	}
-
-	if e.activeSelection == nil {
-		if err := e.resetActive(chain); err != nil {
-			return err
-		}
-	}
-	// else we are re-starting, accumulateActive will catch up as appropriate
-	// for the new head
-
-	e.chainHeadSub = chain.SubscribeChainHeadEvent(e.chainHeadCh)
-	e.runningCh = make(chan interface{})
-	go e.run(chain, e.runningCh)
-
-	return nil
-}
-
-func (e *engine) Stop() error {
-
-	e.logger.Debug("RRR stopping")
-
-	e.runningMu.Lock()
-
-	if e.chainHeadSub != nil {
-		e.chainHeadSub.Unsubscribe()
-	}
-
-	if e.runningCh != nil {
-
-		close(e.runningCh)
-		e.runningCh = nil
-		e.runningMu.Unlock()
-
-		e.runningWG.Wait()
-
-	} else {
-		e.runningMu.Unlock()
-	}
-	return nil
-}
-
 // Author retrieves the Ethereum address of the account that minted the given
 // block, which may be different from the header's coinbase if a consensus
 // engine is based on signatures.
 func (e *engine) Author(header *types.Header) (common.Address, error) {
 	e.logger.Debug("RRR Author")
 
-	_, sealerID, _, err := e.decodeHeaderSeal(header)
+	_, sealerID, _, err := decodeHeaderSeal(header)
 	if err != nil {
 		return common.Address{}, err
 	}
 
 	sealingNodeAddr := common.Address(sealerID.Address())
 
-	if sealingNodeAddr == e.nodeAddr {
+	if sealingNodeAddr == e.r.nodeAddr {
 		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr, "bn", header.Number)
 	} else {
 		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr, "bn", header.Number)
@@ -559,7 +628,7 @@ func (e *engine) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 func (e *engine) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
 	e.logger.Debug("RRR VerifySeal")
 
-	if _, err := e.verifyHeader(chain, header); err != nil {
+	if _, err := e.r.verifyHeader(chain, header); err != nil {
 		return err
 	}
 	return nil
@@ -682,14 +751,7 @@ func sealHash(header *types.Header) common.Hash {
 // that a new block should have. For rrr this is just the round number
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
 	e.logger.Debug("RRR CalcDifficulty")
-
-	e.intentMu.Lock()
-	defer e.intentMu.Unlock()
-
-	if e.candidates[e.nodeAddr] {
-		return difficultyForCandidate
-	}
-	return difficultyForEndorser
+	return e.r.CalcDifficulty(e.r.nodeAddr)
 }
 
 // APIs returns the RPC APIs this consensus engine provides.

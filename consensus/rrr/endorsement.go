@@ -6,18 +6,21 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// Endorsement represents the unsigned approval of a leader candidates intent.
 type Endorsement struct {
 	ChainID    Hash
 	IntentHash Hash
 	EndorserID Hash // NodeID of endorser
 }
 
+// SignedEndorsement is the approval with the appropriate sig
 type SignedEndorsement struct {
 	Endorsement
 	// Sig is the ecdsa signature the [R || S || V] format
 	Sig [65]byte
 }
 
+// SignedEncode encode and sign an endorsment
 func (c *SignedEndorsement) SignedEncode(k *ecdsa.PrivateKey) (rlp.RawValue, error) {
 
 	var err error
@@ -27,6 +30,7 @@ func (c *SignedEndorsement) SignedEncode(k *ecdsa.PrivateKey) (rlp.RawValue, err
 	return r, err
 }
 
+// VerifyNodeSig verifies that the supplied node id signed the endorsement
 func (c *SignedEndorsement) VerifyNodeSig(nodeID Hash) (bool, error) {
 	return verifyNodeSig(nodeID, c.Sig[:], &c.Endorsement)
 }

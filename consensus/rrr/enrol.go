@@ -14,6 +14,7 @@ import (
 // an ecdsa signature the [R || S || V] format
 type Quote [65]byte
 
+// Enrolment provides the RRR identity enrolment data.
 type Enrolment struct {
 	Q Quote
 	U Hash // nodeid for genesis, EnrolmentBinding.U() otherwise

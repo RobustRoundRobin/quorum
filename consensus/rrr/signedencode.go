@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	ErrSignedDecodeSignedFailed = errors.New("decoding signed rlp struct failed")
+	errSignedDecodeSignedFailed = errors.New("decoding signed rlp struct failed")
 )
 
 // verifyNodeSig verifies that sig was produced by the public key for the node

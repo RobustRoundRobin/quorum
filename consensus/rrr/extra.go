@@ -6,6 +6,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// ExtraData is the complete (minus sig) RRR consensus data included on each block
 type ExtraData struct {
 	// SealTime is not part of the protocol. It is used for reporting
 	// disemination latencey. It is the unix time on the sealers system.
@@ -17,12 +18,14 @@ type ExtraData struct {
 	Proof    []byte // Not meaningful until we add VRF support
 }
 
+// SignedExtraData is ExtraData with signature
 type SignedExtraData struct {
 	ExtraData
 	// Sig is the ecdsa signature the [R || S || V] format
 	Sig [65]byte
 }
 
+// SignedEncode signs and encodes the extra data
 func (e *SignedExtraData) SignedEncode(k *ecdsa.PrivateKey) (rlp.RawValue, error) {
 	var err error
 	var r rlp.RawValue
@@ -30,6 +33,7 @@ func (e *SignedExtraData) SignedEncode(k *ecdsa.PrivateKey) (rlp.RawValue, error
 	return r, err
 }
 
+// DecodeSigned decodes a SignedExtraData from the stream
 func (e *SignedExtraData) DecodeSigned(s *rlp.Stream) ([]byte, error) {
 
 	sig, pub, body, err := decodeSigned(s)

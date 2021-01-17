@@ -4,6 +4,7 @@ import "fmt"
 
 // abreviated addresses, so we can more densly report node identities in logs
 
+// HexShort returns an abbreviated hex address
 func (a Address) HexShort() string {
 	return fmtAddrex(a, 3, 2)
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// Intent declares a leader candidates intent to seal a block
 type Intent struct {
 	// ChainID is established in the extradata of the genesis block
 	ChainID Hash
@@ -25,6 +26,7 @@ type Intent struct {
 	TxHash Hash
 }
 
+// Hash hashes the intent
 func (i *Intent) Hash() (Hash, error) {
 	var err error
 	var b []byte
@@ -37,6 +39,7 @@ func (i *Intent) Hash() (Hash, error) {
 	return h, nil
 }
 
+// SignedIntent holds the Intent plus its sig
 type SignedIntent struct {
 	Intent
 	// Sig is the ecdsa signature the [R || S || V] format
@@ -54,6 +57,7 @@ func (i *SignedIntent) SignedEncode(k *ecdsa.PrivateKey) (rlp.RawValue, error) {
 	return r, err
 }
 
+// DecodeSigned decodes ...
 func (i *SignedIntent) DecodeSigned(s *rlp.Stream) ([]byte, error) {
 
 	sig, pub, body, err := decodeSigned(s)

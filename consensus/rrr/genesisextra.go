@@ -8,6 +8,8 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// ChainInit holds the RRR consensus genesis configuration, including
+// genesis enroled identities
 type ChainInit struct {
 	IdentInit []Enrolment
 	He        Hash   // Always zero, as there is no enclave code to hash
@@ -15,6 +17,7 @@ type ChainInit struct {
 	Proof     []byte // simply Sig(CK, Seed) for now, its not really meaningful until we add VRF support
 }
 
+// GenesisExtraData  adds the ChainID which is the hash of the ChainInit
 type GenesisExtraData struct {
 	ChainInit
 	ChainID Hash // EncodeRLP fills this in automatically
@@ -75,6 +78,7 @@ func (ci *ChainInit) Populate(ck *ecdsa.PrivateKey, initIdents []Enrolment, seed
 	return err
 }
 
+// ChainID returns the ChainID
 func (ci *ChainInit) ChainID() (Hash, error) {
 
 	id := Hash{}
@@ -86,6 +90,7 @@ func (ci *ChainInit) ChainID() (Hash, error) {
 	return id, err
 }
 
+// EncodeRLP encodes ...
 func (gd *GenesisExtraData) EncodeRLP(w io.Writer) error {
 
 	var err error

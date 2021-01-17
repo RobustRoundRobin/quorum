@@ -7,6 +7,8 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+// RoundTime takes (some) of the sharp edges of go's time.Timer and provides
+// conveniences for manaing the time based RRR state
 type RoundTime struct {
 	Confirm time.Duration
 	Intent  time.Duration
@@ -87,6 +89,10 @@ func (t *RoundTime) ResetForConfirmPhase() {
 	t.Ticker.Reset(t.Confirm)
 }
 
+// BlockLatencyAdjustment trims the duration for the intent phase according to
+// how long the block took to reach us. This *assumes* the clocks on the nodes
+// are roughly in synch. We don't need this but if it is turned on things are
+// 'smoother'.
 func (t *RoundTime) BlockLatencyAdjustment(
 	now, sealTime time.Time) (
 	RoundPhase, time.Duration) {

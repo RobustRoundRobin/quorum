@@ -35,9 +35,11 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	if number == 0 {
 
 		h0 := Hash{}
-		if e.genesisEx.ChainID == h0 {
-			e.logger.Info("RRR VerifyBranchHeaders - genesis block", "extra", hex.EncodeToString(header.Extra))
-			err := rlp.DecodeBytes(header.Extra, &e.genesisEx)
+		if e.r.genesisEx.ChainID == h0 {
+			e.logger.Info(
+				"RRR VerifyBranchHeaders - genesis block", "extra",
+				hex.EncodeToString(header.Extra))
+			err := rlp.DecodeBytes(header.Extra, &e.r.genesisEx)
 			if err != nil {
 				return err
 			}
@@ -47,7 +49,7 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	}
 
 	// XXX: TODO just verify one deep for now
-	if _, err = e.verifyHeader(chain, header); err != nil {
+	if _, err = e.r.verifyHeader(chain, header); err != nil {
 		return err
 	}
 
@@ -64,22 +66,23 @@ func (e *engine) verifyBranchHeaders(chain consensus.ChainReader, header *types.
 	return nil
 }
 
-func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header) (*SignedExtraData, error) {
+func (r *RoundState) verifyHeader(chain consensus.ChainReader, header *types.Header) (*SignedExtraData, error) {
 
 	if header.Number.Cmp(big0) == 0 {
 		return nil, fmt.Errorf("RRR the genesis header cannot be verified by this method")
 	}
 
 	// Check the seal (extraData) format is correct and signed
-	se, sealerID, _ /*sealerPub*/, err := e.decodeHeaderSeal(header)
+	se, sealerID, _ /*sealerPub*/, err := decodeHeaderSeal(header)
 	if err != nil {
 		return nil, err
 	}
 	// Check that the intent in the seal matches the block described by the
 	// header
-	if se.Intent.ChainID != e.genesisEx.ChainID {
+	if se.Intent.ChainID != r.genesisEx.ChainID {
 		return se, fmt.Errorf(
-			"rrr sealed intent invalid chainid: %s != genesis: %s", se.Intent.ChainID.Hex(), e.genesisEx.ChainID.Hex())
+			"rrr sealed intent invalid chainid: %s != genesis: %s",
+			se.Intent.ChainID.Hex(), r.genesisEx.ChainID.Hex())
 	}
 
 	// Check that the round in the intent matches the block number
@@ -129,7 +132,7 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 
 	for _, end := range se.Confirm {
 		// Check the endorsers ChainID
-		if end.ChainID != e.genesisEx.ChainID {
+		if end.ChainID != r.genesisEx.ChainID {
 			return se, fmt.Errorf("rrr endorsment chainid invalid: `%s'", end.IntentHash.Hex())
 		}
 
@@ -143,11 +146,21 @@ func (e *engine) verifyHeader(chain consensus.ChainReader, header *types.Header)
 	return se, nil
 }
 
-func (e *engine) decodeActivity(header *types.Header) ([]Endorsement, []Enrolment, Hash, []byte, error) {
+// DecodeGenesisExtra decodes the RRR genesis extra data
+func DecodeGenesisExtra(genesisExtra []byte) (*GenesisExtraData, error) {
+	ge := &GenesisExtraData{}
+	err := rlp.DecodeBytes(genesisExtra, ge)
+	if err != nil {
+		return nil, err
+	}
+	return ge, nil
+}
+
+func decodeActivity(chainID Hash, header *types.Header) ([]Endorsement, []Enrolment, Hash, []byte, error) {
 
 	// Common and fast path first
 	if header.Number.Cmp(big0) > 0 {
-		se, sealerID, pub, err := e.decodeHeaderSeal(header)
+		se, sealerID, pub, err := decodeHeaderSeal(header)
 		if err != nil {
 			return nil, nil, Hash{}, nil, err
 		}
@@ -156,16 +169,14 @@ func (e *engine) decodeActivity(header *types.Header) ([]Endorsement, []Enrolmen
 
 	// Genesis block needs special handling, don't short circuit to e.genesisEx
 	// incase we are called in surprising contexts.
-
-	ge := &GenesisExtraData{}
-	err := rlp.DecodeBytes(header.Extra, ge)
+	ge, err := DecodeGenesisExtra(header.Extra)
 	if err != nil {
 		return nil, nil, Hash{}, nil, fmt.Errorf("%v: %w", err, errDecodingGenesisExtra)
 	}
 
 	// But do require consistency, if it has been previously decoded
 	h0 := Hash{}
-	if e.genesisEx.ChainID != h0 && e.genesisEx.ChainID != ge.ChainID {
+	if chainID != h0 && chainID != ge.ChainID {
 		return nil, nil, Hash{}, nil, fmt.Errorf(
 			"genesis header with incorrect chainID: %w", errDecodingGenesisExtra)
 	}
@@ -184,7 +195,7 @@ func (e *engine) decodeActivity(header *types.Header) ([]Endorsement, []Enrolmen
 	return []Endorsement{}, ge.IdentInit, genID, genPub, nil
 }
 
-func (e *engine) decodeHeaderSeal(header *types.Header) (*SignedExtraData, Hash, []byte, error) {
+func decodeHeaderSeal(header *types.Header) (*SignedExtraData, Hash, []byte, error) {
 
 	var err error
 	var pub []byte
