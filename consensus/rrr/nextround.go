@@ -108,12 +108,11 @@ func (r *RoundState) PhaseTick(b broadcaster, chain RRRChainReader) {
 	// We MUST reset, else the Stop when a new block arrives will block
 	if r.Phase == RoundPhaseIntent {
 
-		// Completed intent phase, if we have a signedIntent here, it means we
-		// have not seen an intent from the oldest selected and this is the
-		// oldest we have seen. So go ahead and send it. This gives us liveness
-		// in the face of network issues and misbehaviour. The > Nc the stronger
-		// the mitigation. Notice that we DO NOT check if we are currently
-		// selected as an endorser.
+		// Completed intent phase, the intent we have here, if any, is the
+		// oldest we have seen. This gives us liveness in the face of network
+		// issues and misbehaviour. The > Nc the stronger the mitigation.
+		// Notice that we DO NOT check if we are currently selected as an
+		// endorser.
 		// XXX: TODO given what we are doing with intents, endorsements and
 		// failedAttempts now, I'm not sure having strict intent and
 		// confirmation phases makese sense - one 'attempt' phase timer should

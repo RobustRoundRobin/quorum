@@ -156,45 +156,6 @@ func DecodeGenesisExtra(genesisExtra []byte) (*GenesisExtraData, error) {
 	return ge, nil
 }
 
-func decodeActivity(chainID Hash, header *types.Header) ([]Endorsement, []Enrolment, Hash, []byte, error) {
-
-	// Common and fast path first
-	if header.Number.Cmp(big0) > 0 {
-		se, sealerID, pub, err := decodeHeaderSeal(header)
-		if err != nil {
-			return nil, nil, Hash{}, nil, err
-		}
-		return se.ExtraData.Confirm, se.ExtraData.Enrol, sealerID, pub, nil
-	}
-
-	// Genesis block needs special handling, don't short circuit to e.genesisEx
-	// incase we are called in surprising contexts.
-	ge, err := DecodeGenesisExtra(header.Extra)
-	if err != nil {
-		return nil, nil, Hash{}, nil, fmt.Errorf("%v: %w", err, errDecodingGenesisExtra)
-	}
-
-	// But do require consistency, if it has been previously decoded
-	h0 := Hash{}
-	if chainID != h0 && chainID != ge.ChainID {
-		return nil, nil, Hash{}, nil, fmt.Errorf(
-			"genesis header with incorrect chainID: %w", errDecodingGenesisExtra)
-	}
-
-	// Get the genesis signer public key and node id. Do this derivation of
-	// node id and public key unconditionally regardless of wheter we think we
-	// have the information to hand - it is just safer that way.
-	genPub, err := Ecrecover(ge.IdentInit[0].U[:], ge.IdentInit[0].Q[:])
-	if err != nil {
-		return nil, nil, Hash{}, nil, fmt.Errorf("%v:%w", err, errGensisIdentitiesInvalid)
-	}
-
-	genID := Hash{}
-	copy(genID[:], Keccak256(genPub[1:65]))
-
-	return []Endorsement{}, ge.IdentInit, genID, genPub, nil
-}
-
 func decodeHeaderSeal(header *types.Header) (*SignedExtraData, Hash, []byte, error) {
 
 	var err error

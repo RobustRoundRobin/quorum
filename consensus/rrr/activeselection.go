@@ -155,11 +155,81 @@ func (a *ActiveSelection) Prime(activity uint64, head *types.Block) {
 	// 'activity' in the genesis block.
 }
 
+// blockHeaderReader defines the interface required by AccumulateActive
+type blockHeaderReader interface {
+	GetHeaderByHash(hash common.Hash) *types.Header
+}
+
+// BlockActivity is the decoded RRR consensus block activity data from the
+// block header extra data.
+type BlockActivity struct {
+	Confirm   []Endorsement
+	Enrol     []Enrolment
+	SealerID  Hash
+	SealerPub []byte
+}
+
+// Decode decodes the RRR consensus activity data from the header extra data.
+// Any activity previously held is completely discarded
+func (a *BlockActivity) Decode(chainID Hash, header *types.Header) error {
+
+	var err error
+	var se *SignedExtraData
+
+	a.Confirm = nil
+	a.Enrol = nil
+	a.SealerID = Hash{}
+	a.SealerPub = nil
+
+	// Common and fast path first
+	if header.Number.Cmp(big0) > 0 {
+		se, a.SealerID, a.SealerPub, err = decodeHeaderSeal(header)
+		if err != nil {
+			return err
+		}
+		a.Confirm = se.ExtraData.Confirm
+		a.Enrol = se.ExtraData.Enrol
+		return nil
+	}
+
+	// Genesis block needs special handling.
+	ge, err := DecodeGenesisExtra(header.Extra)
+	if err != nil {
+		return fmt.Errorf("%v: %w", err, errDecodingGenesisExtra)
+	}
+
+	// But do require consistency, if it has been previously decoded
+	h0 := Hash{}
+	if chainID != h0 && chainID != ge.ChainID {
+		return fmt.Errorf(
+			"genesis header with incorrect chainID: %w", errDecodingGenesisExtra)
+	}
+
+	// Get the genesis signer public key and node id. Do this derivation of
+	// node id and public key unconditionally regardless of wheter we think we
+	// have the information to hand - it is just safer that way.
+	a.SealerPub, err = Ecrecover(ge.IdentInit[0].U[:], ge.IdentInit[0].Q[:])
+	if err != nil {
+		return fmt.Errorf("%v:%w", err, errGensisIdentitiesInvalid)
+	}
+
+	copy(a.SealerID[:], Keccak256(a.SealerPub[1:65]))
+
+	a.Confirm = []Endorsement{}
+	a.Enrol = ge.IdentInit
+
+	return nil
+}
+
 // AccumulateActive is effectively SelectActive from the paper, but with the
 // 'obvious' caching optimisations. AND importantly we only add active
 // identities to the active set here, we do not cull idles. That is left to
 // selectCandidatesAndEndorsers.
-func (a *ActiveSelection) AccumulateActive(chainID Hash, activity uint64, chain RRRChainReader, head *types.Header) error {
+func (a *ActiveSelection) AccumulateActive(
+	chainID Hash, activity uint64, chain blockHeaderReader, head *types.Header,
+) error {
+
+	var err error
 
 	if head == nil {
 		return nil
@@ -168,6 +238,8 @@ func (a *ActiveSelection) AccumulateActive(chainID Hash, activity uint64, chain 
 	if headHash == a.lastBlockSeen {
 		return nil
 	}
+
+	blockActivity := BlockActivity{}
 
 	cur := head
 
@@ -215,13 +287,12 @@ func (a *ActiveSelection) AccumulateActive(chainID Hash, activity uint64, chain 
 				head.Number, head.Hash(), errBranchDetected)
 		}
 
-		confirms, enrols, sealerID, sealerPub, err := decodeActivity(chainID, cur)
-		if err != nil {
+		if err = blockActivity.Decode(chainID, cur); err != nil {
 			return err
 		}
 
 		// telemetry only
-		if sealer := a.aged[sealerID.Address()]; sealer != nil {
+		if sealer := a.aged[blockActivity.SealerID.Address()]; sealer != nil {
 			age := sealer.Value.(*idActivity)
 			var agemsg string
 			if age.ageBlock.Cmp(cur.Number) < 0 {
@@ -232,7 +303,7 @@ func (a *ActiveSelection) AccumulateActive(chainID Hash, activity uint64, chain 
 
 			a.logger.Debug(
 				"RRR accumulateActive - sealer",
-				"addr", sealerID.Address().HexShort(), "age", agemsg)
+				"addr", blockActivity.SealerID.Address().HexShort(), "age", agemsg)
 		} else {
 			// first block from this sealer since it went idle or was first
 			// enrolled. if it went idle we could have seen an endorsement for
@@ -240,17 +311,20 @@ func (a *ActiveSelection) AccumulateActive(chainID Hash, activity uint64, chain 
 			// with the identity.
 			a.logger.Debug(
 				"RRR accumulateActive - new sealer",
-				"addr", sealerID.Address().HexShort(), "age", fmt.Sprintf("00.%05d", cur.Number))
+				"addr", blockActivity.SealerID.Address().HexShort(), "age", fmt.Sprintf("00.%05d", cur.Number))
 		} // end telemetry only
 
 		// The sealer is minting and to preserve the "round" ordering, needs to
 		// move to the youngest position - before the identities that may be
 		// enrolled.
-		a.refreshAge(youngestKnown, sealerID, h, cur.Number, 0)
+		a.refreshAge(youngestKnown, blockActivity.SealerID, h, cur.Number, 0)
 
 		// Do any enrolments. (Re) Enrolling an identity moves it to the
 		// youngest position in the activity set
-		a.enrolIdentities(chainID, youngestKnown, sealerID, sealerPub, enrols, h, cur.Number)
+		a.enrolIdentities(
+			chainID, youngestKnown,
+			blockActivity.SealerID, blockActivity.SealerPub, blockActivity.Enrol,
+			h, cur.Number)
 
 		// The endorsers are active, they do not move in the age ordering.
 		// Note however, for any identity enrolled after genesis, as we are
@@ -259,7 +333,7 @@ func (a *ActiveSelection) AccumulateActive(chainID Hash, activity uint64, chain 
 		// identity must have been enrolled within Ta of this *cur* block else
 		// it could not have been selected as an endorser. However, it may not
 		// be within Ta of where we started accumulateActive
-		for _, end := range confirms {
+		for _, end := range blockActivity.Confirm {
 			// xxx: should probably log when we see a confirmation for an
 			// enrolment we haven't had yet, that is 'interesting'
 			a.recordActivity(end.EndorserID, h, cur.Number)
@@ -627,14 +701,15 @@ func (a *ActiveSelection) recordActivity(nodeID Hash, endorsed Hash, blockNumber
 // refreshAge called to indicate that nodeID has minted a block or been
 // enrolled. If this is the youngest block minted by the identity, we move its
 // entry after the fence.  Counter intuitively, we always insert the at the
-// 'oldest' position. Because accumulateActive works from the head (youngest)
-// towards genesis.  If no fence is provided the entry is added at the back
-// (oldest position). If a fence is provided, the entry is added immediately
-// after the fence - which is the oldest position *after* the fence.
-// accumulateActive uses the last block it saw as the fence. enrolIdentities
-// processes enrolments for a block in reverse order of age. These two things
-// combined give us an efficient way to always have identities sorted in age
-// order.
+// 'oldest' position after the fence. Because accumulateActive works from the
+// head (youngest) towards genesis we are visiting from the youngest to the
+// oldest. By always inserting after the youngest that was in the list when we
+// started, we preserve that order. In the special case where the list starts
+// empty the fence is nil. In this case to preserve the order we *PushBack* -
+// the first identity we add will be left at the *youngest* position.
+// enrolIdentities is careful to processe enrolments for a block in reverse
+// order of age. Taken all together, this give us an efficient way to always
+// have identities sorted in age order.
 func (a *ActiveSelection) refreshAge(
 	fence *list.Element, nodeID Hash, block Hash, blockNumber *big.Int, order int,
 ) {
@@ -657,9 +732,9 @@ func (a *ActiveSelection) refreshAge(
 				fmt.Sprintf("%02d.%d->%d", order, aged.ageBlock, blockNumber))
 
 			if fence != nil {
-				// This is effectively MoveToBack, with fence as the logical back.Prev()
 				a.activeSelection.MoveAfter(el, fence)
 			} else {
+				// Here we are assuming the list started *empty*
 				a.activeSelection.MoveToBack(el)
 			}
 			aged.ageBlock.Set(blockNumber)
@@ -691,11 +766,12 @@ func (a *ActiveSelection) refreshAge(
 		aged.order = order
 
 		if fence != nil {
-			// This is effectively PushBack, with fence as the logical back.Prev()
 			a.aged[nodeAddr] = a.activeSelection.InsertAfter(aged, fence)
 		} else {
+			// Here we are assuming the list started *empty*
 			a.aged[nodeAddr] = a.activeSelection.PushBack(aged)
 		}
+
 	}
 
 	// Setting ageBlock resets the age of the identity. The test for active is
