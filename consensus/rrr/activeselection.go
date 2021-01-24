@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"math/rand"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/log"
@@ -268,7 +267,7 @@ func (a *ActiveSelection) AccumulateActive(
 		// relying on the cached activeBlockFence.
 		headNumber := big.NewInt(0).Set(head.Number) // because Sub modifies self
 		depth := headNumber.Sub(headNumber, cur.Number)
-		if !depth.IsUint64() || depth.Uint64() > activity {
+		if !depth.IsUint64() || depth.Uint64() >= activity {
 			a.logger.Trace("RRR accumulateActive - complete, reached activity depth", "Ta", activity)
 			break
 		}
@@ -311,7 +310,8 @@ func (a *ActiveSelection) AccumulateActive(
 			// with the identity.
 			a.logger.Debug(
 				"RRR accumulateActive - new sealer",
-				"addr", blockActivity.SealerID.Address().HexShort(), "age", fmt.Sprintf("00.%05d", cur.Number))
+				"addr", blockActivity.SealerID.Address().HexShort(),
+				"age", fmt.Sprintf("00.%05d", cur.Number))
 		} // end telemetry only
 
 		// The sealer is minting and to preserve the "round" ordering, needs to
@@ -358,13 +358,15 @@ func (a *ActiveSelection) AccumulateActive(
 	return nil
 }
 
+type randPerm func(int) []int
+
 // SelectCandidatesAndEndorsers determines if the current node is a leader
 // candidate and what the current endorsers are. The key requirement of RRR met
 // here  is that the results of this function should be the same on all nodes
 // assuming they run accumulateActive starting from the same `head' block. This
 // is both SelectCandidates and SelectEndorsers from the paper.
 func (a *ActiveSelection) SelectCandidatesAndEndorsers(
-	rand *rand.Rand, nCandidates, nEndorsers, quorum, failedAttempts uint,
+	randPerm randPerm, nCandidates, nEndorsers, quorum, failedAttempts uint,
 	chain RRRChainReader, selfNodeID Hash,
 ) (map[common.Address]bool, map[common.Address]bool, []common.Address, error) {
 
@@ -416,7 +418,7 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 	// Get a random permutation of ALL active identities eligible as endorsers,
 	// then take the first e.config.Endorsers in that permutation. This gives
 	// us a random selection of endorsers with replacement.
-	permutation := rand.Perm(int(nActive) - int(nCandidates))
+	permutation := randPerm(int(nActive) - int(nCandidates))
 	iend := nEndorsers
 	if uint(len(permutation)) < iend {
 		iend = uint(len(permutation))
@@ -592,7 +594,8 @@ func (a *idActivity) lastActiveBlock() *big.Int {
 }
 
 func (a *ActiveSelection) enrolIdentities(
-	chainID Hash, fence *list.Element, sealerID Hash, sealerPub []byte, enrolments []Enrolment, block Hash, number *big.Int,
+	chainID Hash, fence *list.Element, sealerID Hash,
+	sealerPub []byte, enrolments []Enrolment, block Hash, number *big.Int,
 ) error {
 
 	enbind := &EnrolmentBinding{
@@ -635,7 +638,8 @@ func (a *ActiveSelection) enrolIdentities(
 	}
 
 	// The 'youngest' enrolment in the block is the last in the slice. And it
-	// is essential that we refreshAge youngest -> oldest
+	// is essential that we refreshAge youngest to oldest
+	// (resuting in oldest <- youngest order)
 	for i := 0; i < len(enrolments); i++ {
 
 		order := len(enrolments) - i - 1 // the last enrolment is the youngest
@@ -657,6 +661,16 @@ func (a *ActiveSelection) enrolIdentities(
 		if !ok {
 			return fmt.Errorf("sealer-id=`%s',id=`%s',u=`%s':%w",
 				sealerID.Hex(), enr.ID.Hex(), enr.U.Hex(), errEnrolmentInvalid)
+		}
+
+		// For the genesis block sealer id is also the first enroled identity.
+		// The sealer age is refreshed directly in AccumulateActive. But note
+		// that we still apply all the verification
+		if sealerID == enr.ID {
+			a.logger.Trace(
+				"RRR enrolIdentities - sealer found in enrolments",
+				"bn", number, "#", block.Hex())
+			continue
 		}
 
 		a.refreshAge(fence, enr.ID, block, number, order)
@@ -728,11 +742,12 @@ func (a *ActiveSelection) refreshAge(
 		if aged.ageBlock.Cmp(blockNumber) <= 0 {
 
 			a.logger.Trace("RRR refreshAge - move",
-				"addr", nodeAddr.HexShort(), "age",
+				"fenced", bool(fence != nil), "addr", nodeAddr.HexShort(), "age",
 				fmt.Sprintf("%02d.%d->%d", order, aged.ageBlock, blockNumber))
 
 			if fence != nil {
-				a.activeSelection.MoveAfter(el, fence)
+				// Note: 'Before' means *in front of*
+				a.activeSelection.MoveBefore(el, fence)
 			} else {
 				// Here we are assuming the list started *empty*
 				a.activeSelection.MoveToBack(el)
@@ -766,7 +781,8 @@ func (a *ActiveSelection) refreshAge(
 		aged.order = order
 
 		if fence != nil {
-			a.aged[nodeAddr] = a.activeSelection.InsertAfter(aged, fence)
+			// Note: 'Before' means *in front of*
+			a.aged[nodeAddr] = a.activeSelection.InsertBefore(aged, fence)
 		} else {
 			// Here we are assuming the list started *empty*
 			a.aged[nodeAddr] = a.activeSelection.PushBack(aged)

@@ -360,7 +360,7 @@ func (r *RoundState) nextRoundState(
 	// If we are a leader candidate we need to broadcast an intent.
 	var err error
 	r.candidates, r.endorsers, r.selection, err = r.a.SelectCandidatesAndEndorsers(
-		r.Rand,
+		r.Rand.Perm,
 		uint(r.config.Candidates), uint(r.config.Endorsers), uint(r.config.Quorum),
 		r.FailedAttempts,
 		chain, r.nodeID)

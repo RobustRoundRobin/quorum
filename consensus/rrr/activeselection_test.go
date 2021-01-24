@@ -2,6 +2,7 @@ package rrr
 
 import (
 	"crypto/ecdsa"
+	"errors"
 	"math/big"
 	"os"
 	"testing"
@@ -64,6 +65,47 @@ func TestDecodeActivity(t *testing.T) {
 	assert.Len(a.Confirm, 2, "missing confirmations")
 }
 
+// TestAccumulateGenesisActivity tests that the order of enrolments
+// in the gensis block match the order produced by ActiveSelection from the
+// genesis block
+func TestAccumulateGenesisActivity(t *testing.T) {
+
+	require := require.New(t)
+	assert := assert.New(t)
+
+	logger := log.New()
+	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
+
+	tActive := uint64(10)
+	numIdents := 12
+
+	net := newNetwork(t, numIdents)
+	ch := newChain(net.genesis)
+
+	a := &ActiveSelection{logger: logger}
+	a.Reset(tActive, net.genesis)
+
+	err := a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+
+	require.NoError(err)
+	assert.Equal(a.activeSelection.Len(), numIdents, "missing active from selection")
+
+	// For the genesis block, the age ordering should exactly match the
+	// enrolment order. And the identity that signed the genesis block should be
+	// the youngest - as it is considered more recently active than any identity
+	// it enrols in the block it seals.
+	order := make([]int, numIdents)
+	for i := 0; i < numIdents-1; i++ {
+		order[i] = i + 1
+	}
+	order[numIdents-1] = 0
+
+	a.requireOrder(t, net, order)
+}
+
+// TestFirstAccumulate tests the accumulation of activity from the first
+// consensus block (the block after genesis)
 func TestFirstAccumulate(t *testing.T) {
 
 	logger := log.New()
@@ -93,6 +135,180 @@ func TestFirstAccumulate(t *testing.T) {
 	require.True(ok)
 	assert.Equal(id, 0)
 
+}
+
+// TestAccumulateTwice tests that the order is stable (and correct) if the same
+// identity is encountered twice. The first encounter of the identity in an
+// accumulation determines its age. Any subsequent enconter should not change
+// it.
+func TestAccumulateTwice(t *testing.T) {
+	require := require.New(t)
+
+	logger := log.New()
+	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
+
+	tActive := uint64(10)
+	numIdents := 12
+
+	net := newNetwork(t, numIdents)
+	ch := newChain(net.genesis)
+
+	a := &ActiveSelection{logger: logger}
+	a.Reset(tActive, net.genesis)
+
+	// Establish the intial ordering from the genesis block.
+	err := a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+	require.NoError(err)
+
+	// Now id(0) is the youngest, and id(1) is the oldest
+
+	// Make 3 blocks. The first and the last will be sealed by the same identity.
+
+	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
+	// Imagining the rounds progress as expected, 2 should seal next
+	ch.Extend(net, 2, 3, 4, 5)
+	// Something very odd happened and 1 seals the next block (in reality this
+	// implies a lot of failed attempts and un reachable nodes). Lets make the
+	// endorsers the same too.
+	ch.Extend(net, 1, 2, 3, 4)
+
+	idYoungest := net.nodeID2id[a.activeSelection.Front().Value.(*idActivity).nodeID]
+
+	// [ ..., 0]
+	// [ ..., 0, 1]
+	// [ ..., 0, 1, 2]
+	// [ ..., 0, 2, 1]
+
+	err = a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+	require.NoError(err)
+	idYoungestAfter := net.nodeID2id[a.activeSelection.Front().Value.(*idActivity).nodeID]
+
+	order := []int{3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 2, 1}
+
+	a.logger.Info("youngest before", "id", idYoungest)
+	a.logger.Info("youngest after", "id", idYoungestAfter)
+	a.requireOrder(t, net, order)
+}
+
+// TestBranchDetection tests that AccumulateActive spots forks and returns a
+// specific error for that case.
+func TestBranchDetection(t *testing.T) {
+	require := require.New(t)
+
+	logger := log.New()
+	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
+
+	tActive := uint64(10)
+	numIdents := 12
+
+	net := newNetwork(t, numIdents)
+	ch := newChain(net.genesis)
+
+	a := &ActiveSelection{logger: logger}
+	a.Reset(tActive, net.genesis)
+
+	// build a 4 block chain
+	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
+	ch.Extend(net, 2, 3, 4, 5)
+	ch.Extend(net, 3, 4, 5, 6)
+	ch.Extend(net, 4, 5, 6, 7)
+
+	err := a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+	require.NoError(err)
+
+	// Make a fork from block 2
+	intent := net.newIntent(5, ch.blocks[2], 0)
+	confirm := net.endorseIntent(intent, 6, 7, 8)
+	forkFirst := net.sealBlock(5, intent, confirm, dummySeed)
+	ch.Add(forkFirst)
+	// Now CurrentBlock will return the forked block so we can use extend
+	ch.Extend(net, 6, 7, 8, 9)
+
+	err = a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+	require.True(errors.Is(err, errBranchDetected))
+}
+
+// TestShortActivityHorizon tests that the age order of the active selection is
+// correct in the event that the activity horizon does not move all identities.
+// As is the case when one or more identities are idle - idle means "not seen
+// within Ta active". Also, except for the early stages of the chain, Ta
+// (active) will be smaller than the block height and this covers that scenario
+// too. Note that AccumulateActive does not explicitly identify idles - it leaves
+// the unvisited items in the list in their last known possition.
+// selectCandidatesAndEndorsers deals with pruning and moving to the idle pool.
+func TestShortActityHorizon(t *testing.T) {
+	require := require.New(t)
+
+	logger := log.New()
+	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
+
+	tActive := uint64(5)
+	numIdents := 12
+
+	net := newNetwork(t, numIdents)
+	ch := newChain(net.genesis)
+
+	a := &ActiveSelection{logger: logger}
+	a.Reset(tActive, net.genesis)
+
+	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
+	ch.Extend(net, 2, 3, 4, 5)
+	ch.Extend(net, 3, 4, 5, 6)
+	ch.Extend(net, 4, 5, 6, 7)
+
+	err := a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+	require.NoError(err)
+
+	// We have exactly 5 blocks including the genesis. The genesis has activity
+	// for all 12 identities.
+	order := []int{5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4}
+	a.requireOrder(t, net, order)
+
+	// Add 7 more blocks
+	ch.Extend(net, 5, 6, 7, 8)
+	ch.Extend(net, 6, 7, 8, 9)
+	ch.Extend(net, 7, 8, 9, 10)
+	ch.Extend(net, 8, 9, 10, 11)
+	ch.Extend(net, 9, 10, 11, 0)
+	ch.Extend(net, 10, 11, 0, 1)
+	ch.Extend(net, 11, 0, 1, 2)
+	ch.Extend(net, 0, 1, 2, 3)
+
+	err = a.AccumulateActive(
+		net.ge.ChainID, tActive, ch, ch.CurrentBlock().Header())
+	require.NoError(err)
+
+	// Now we expect the sealers of the most recent 5 to move, and everything
+	// else to stay as it was. selectCandidatesAndEndorsers *skips* items that
+	// are beyond the tActive horizon. When idles are fully implemented,
+	// skipping will involve moving to the idle pool.
+
+	order = []int{5, 6, 7, 1, 2, 3, 4,
+		8, 9, 10, 11, 0}
+	a.requireOrder(t, net, order)
+}
+
+func (a *ActiveSelection) requireOrder(t *testing.T, net *network, order []int) {
+
+	nok := 0
+
+	for cur, icur := a.activeSelection.Back(), 0; cur != nil; cur, icur = cur.Prev(), icur+1 {
+
+		age := cur.Value.(*idActivity)
+		ok := order[icur] == net.nodeID2id[age.nodeID]
+		if ok {
+			nok++
+		}
+		a.logger.Info(
+			"activeItem", "ok", ok, "addr", age.nodeID.Address().HexShort(),
+			"order", order[icur], "id", net.nodeID2id[age.nodeID], "position", a.activeSelection.Len()-icur)
+	}
+	require.Equal(t, nok, len(order))
 }
 
 // network represents a network of identities participating in RRR consensus
@@ -141,9 +357,14 @@ func (ch *chain) Extend(net *network, idSeal int, idConfirm ...int) *types.Block
 	intent := net.newIntent(idSeal, parent, 0)
 	confirm := net.endorseIntent(intent, idConfirm...)
 	block := net.sealBlock(idSeal, intent, confirm, dummySeed)
+	ch.Add(block)
+	return block
+}
+
+// Add adds a block
+func (ch *chain) Add(block *types.Block) {
 	ch.blocks = append(ch.blocks, block)
 	ch.db[block.Header().Hash()] = len(ch.blocks) - 1
-	return block
 }
 
 func newNetwork(t *testing.T, numIdents int) *network {
