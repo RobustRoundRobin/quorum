@@ -84,3 +84,25 @@ func RecoverPublic(h []byte, sig []byte) (*ecdsa.PublicKey, error) {
 	}
 	return pub, nil
 }
+
+// BytesToPublic converts a raw 65 byte secp256k1 public key to an ecdsa.PublicKey
+func BytesToPublic(b []byte) (*ecdsa.PublicKey, error) {
+
+	if len(b) != 65 {
+		return nil, errors.New("pub must be 65 bytes")
+	}
+
+	// re-build the public key for the private key used to sign the userdata
+	// hash
+	//
+	// per 2.3.4 sec1-v2 for uncompresed representation "otherwise the leftmost
+	// octet of the octetstring is removed"
+
+	pub := &ecdsa.PublicKey{Curve: crypto.S256(), X: new(big.Int), Y: new(big.Int)}
+	pub.X.SetBytes(b[1 : 1+32])
+	pub.Y.SetBytes(b[1+32 : 1+64])
+	if !pub.Curve.IsOnCurve(pub.X, pub.Y) {
+		return nil, errors.New("invalid secp256k1 curve point")
+	}
+	return pub, nil
+}

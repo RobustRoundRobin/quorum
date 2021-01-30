@@ -187,7 +187,7 @@ func (r *RoundState) PhaseTick(b broadcaster, chain RRRChainReader) {
 
 	case RRRStateLeaderCandidate:
 
-		if confirmed, err = r.sealCurrentBlock(); confirmed {
+		if confirmed, err = r.sealCurrentBlock(chain); confirmed {
 
 			r.logger.Info("RRR tick - sealed block", "addr", r.nodeAddr.Hex(),
 				"r", r.Number, "f", r.FailedAttempts)
@@ -335,12 +335,12 @@ func (r *RoundState) readHead(chain RRRChainReader, head *types.Block) (
 		seed = r.genesisEx.ChainInit.Seed
 	}
 
-	if len(seed) != 8 {
+	if len(seed) != 32 {
 		return nil, nil, nil, nil, fmt.Errorf(
-			"RRR readHead - seed wrong length should be 8 not %d", len(seed))
+			"RRR readHead - seed wrong length should be 32 not %d", len(seed))
 	}
 
-	return blockNumber, seed, se, head, nil
+	return blockNumber, seed[:8], se, head, nil
 }
 
 // nextRoundState re-samples the active identities and returns the round state

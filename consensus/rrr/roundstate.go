@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/vechain/go-ecvrf"
 )
 
 // RRRState type for the round state
@@ -80,6 +81,7 @@ type RoundState struct {
 	nodeID     Hash // derived from privateKey
 	nodeAddr   common.Address
 
+	vrf            ecvrf.VRF
 	T              *RoundTime
 	Rand           *rand.Rand
 	Phase          RoundPhase
@@ -145,10 +147,12 @@ func NewRoundState(key *ecdsa.PrivateKey, config *Config, logger log.Logger) *Ro
 	s := &RoundState{
 		logger:     logger,
 		privateKey: key,
-		nodeID:     Pub2NodeID(&key.PublicKey),
-		nodeAddr:   crypto.PubkeyToAddress(key.PublicKey),
-		config:     config,
-		T:          NewRoundTime(config.RoundLength, config.ConfirmPhase, logger),
+
+		nodeID:   Pub2NodeID(&key.PublicKey),
+		nodeAddr: crypto.PubkeyToAddress(key.PublicKey),
+		config:   config,
+		vrf:      ecvrf.NewSecp256k1Sha256Tai(),
+		T:        NewRoundTime(config.RoundLength, config.ConfirmPhase, logger),
 	}
 	return s
 }

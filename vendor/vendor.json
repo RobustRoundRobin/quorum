@@ -883,6 +883,12 @@
 			"revisionTime": "2018-06-15T20:27:29Z"
 		},
 		{
+			"checksumSHA1": "VJHHllSfyaYk/K2XZW20q5ZGrNU=",
+			"path": "github.com/vechain/go-ecvrf",
+			"revision": "5b7e9ee61906ec92fc512c382aee9d4366081886",
+			"revisionTime": "2020-03-26T08:04:14Z"
+		},
+		{
 			"checksumSHA1": "GLCPuvePAkWT+opcWq3mNdhOfGM=",
 			"path": "github.com/wsddn/go-ecdh",
 			"revision": "48726bab92085232373de4ec5c51ce7b441c63a0",

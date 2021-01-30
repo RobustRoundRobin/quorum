@@ -5,7 +5,6 @@ package rrr
 // the block.
 
 import (
-	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -287,7 +286,7 @@ func (r *RoundState) handleEndorsement(et *engSignedEndorsement) error {
 // arrangements in geth (and its eth/devp2p machinery). Note that this is
 // called on all nodes, only legitemate leader candidates will recieve enough
 // endorsments for non-byzantine scenarios.
-func (r *RoundState) sealCurrentBlock() (bool, error) {
+func (r *RoundState) sealCurrentBlock(chain RRRChainReader) (bool, error) {
 
 	r.intentMu.Lock()
 	defer r.intentMu.Unlock()
@@ -339,20 +338,26 @@ func (r *RoundState) sealCurrentBlock() (bool, error) {
 	// double up on checks here.
 	header := r.sealTask.Block.Header()
 
-	// role a new seed for the next round, this is all a bit 'make believe' in
-	// the absence of VRF's
-	seed := make([]byte, 8)
-	nrand, err := cryptorand.Read(seed)
+	// Work out the stable seed. We want to take this from a block that we are
+	// probabalistically very confident is part of the canonical chain. 'd'
+	// rounds before the current. Here we deal with the early blocks where d >
+	// block height.
+	alpha := r.genesisEx.ChainInit.Seed
+
+	blockNumber := r.Number.Uint64()
+	if r.config.StablePrefixDepth < blockNumber {
+
+		stableHeader := chain.GetHeaderByNumber(blockNumber - r.config.StablePrefixDepth)
+		se, _, _, err := decodeHeaderSeal(stableHeader)
+		if err != nil {
+			return false, fmt.Errorf("failed decoding stable header seal: %v", err)
+		}
+		alpha = se.Seed
+	}
+
+	beta, pi, err := r.vrf.Prove(r.privateKey, alpha)
 	if err != nil {
-		return false, fmt.Errorf(
-			"crypto/rand.Read failed - %v: %w", err, errSealSeedFailed)
-	}
-	if nrand != 8 {
-		return false, fmt.Errorf(
-			"crypto/rand.Read insufficient entropy - %v: %w", err, errSealSeedFailed)
-	}
-	if err != nil || nrand != 8 {
-		return false, fmt.Errorf("failed reading random seed")
+		return false, fmt.Errorf("failed proving new seed: %v", err)
 	}
 
 	data := &SignedExtraData{
@@ -360,13 +365,15 @@ func (r *RoundState) sealCurrentBlock() (bool, error) {
 			SealTime: uint64(time.Now().Unix()),
 			Intent:   r.intent.SI.Intent,
 			Confirm:  make([]Endorsement, len(r.intent.Endorsements)),
-			Seed:     seed,
+			Seed:     beta,
+			Proof:    pi,
 		},
-		// XXX: TODO seed proof / VRF's
 	}
+
 	for i, c := range r.intent.Endorsements {
 		data.Confirm[i] = c.Endorsement
 	}
+
 	seal, err := data.SignedEncode(r.privateKey)
 	if err != nil {
 		return false, err

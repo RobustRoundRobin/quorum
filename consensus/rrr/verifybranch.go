@@ -1,6 +1,7 @@
 package rrr
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -73,10 +74,15 @@ func (r *RoundState) verifyHeader(chain consensus.ChainReader, header *types.Hea
 	}
 
 	// Check the seal (extraData) format is correct and signed
-	se, sealerID, _ /*sealerPub*/, err := decodeHeaderSeal(header)
+	se, sealerID, pub, err := decodeHeaderSeal(header)
 	if err != nil {
 		return nil, err
 	}
+	sealerPub, err := BytesToPublic(pub)
+	if err != nil {
+		return nil, err
+	}
+
 	// Check that the intent in the seal matches the block described by the
 	// header
 	if se.Intent.ChainID != r.genesisEx.ChainID {
@@ -121,6 +127,32 @@ func (r *RoundState) verifyHeader(chain consensus.ChainReader, header *types.Hea
 		return se, fmt.Errorf("rrr txhash mismatch: sealed=`%s' header=`%s'",
 			hex.EncodeToString(se.Intent.TxHash[:]),
 			hex.EncodeToString(header.TxHash[:]))
+	}
+
+	// Verify the seed VRF result.
+	blockNumber := header.Number.Uint64()
+
+	// The input (or alpha) is from the block at the head of the stable prefix
+	// (or the genesis)
+	alpha := r.genesisEx.ChainInit.Seed
+	if r.config.StablePrefixDepth < blockNumber {
+		stableHeader := chain.GetHeaderByNumber(blockNumber - r.config.StablePrefixDepth)
+		se, _, _, err := decodeHeaderSeal(stableHeader)
+		if err != nil {
+			return nil, fmt.Errorf("failed decoding stable header seal: %v", err)
+		}
+		alpha = se.Seed
+	}
+
+	// The beta, pi (seed, proof) is on this block header
+	beta, err := r.vrf.Verify(sealerPub, alpha, se.Proof)
+	if err != nil {
+		return nil, fmt.Errorf("VRF Verify failed: %v", err)
+	}
+	if bytes.Compare(se.Seed, beta) != 0 {
+		return nil, fmt.Errorf(
+			"VRF Verify failed. seed doesn't match proof: %v != %v",
+			hex.EncodeToString(se.Seed), hex.EncodeToString(beta))
 	}
 
 	// Check all the endorsements. First check the intrinsic validity

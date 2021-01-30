@@ -13,8 +13,8 @@ import (
 type ChainInit struct {
 	IdentInit []Enrolment
 	He        Hash   // Always zero, as there is no enclave code to hash
-	Seed      []byte // generate using crypto/rand for now
-	Proof     []byte // simply Sig(CK, Seed) for now, its not really meaningful until we add VRF support
+	Seed      []byte // beta output of VRF(genesisNodeID).
+	Proof     []byte // pi ouptut of VRF(genesisNodeID)
 }
 
 // GenesisExtraData  adds the ChainID which is the hash of the ChainInit
@@ -65,7 +65,8 @@ func IdentInit(ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrol
 
 // Populate fills in a ChainInit ready for encoding in the genesis extraData
 // See EIP-rrr/extraData of Block0/9.
-func (ci *ChainInit) Populate(ck *ecdsa.PrivateKey, initIdents []Enrolment, seed []byte) error {
+func (ci *ChainInit) Populate(
+	ck *ecdsa.PrivateKey, initIdents []Enrolment, seed, proof []byte) {
 
 	ci.IdentInit = make([]Enrolment, len(initIdents))
 	ci.Seed = make([]byte, len(seed))
@@ -73,9 +74,7 @@ func (ci *ChainInit) Populate(ck *ecdsa.PrivateKey, initIdents []Enrolment, seed
 	copy(ci.IdentInit, initIdents)
 
 	copy(ci.Seed, seed)
-	var err error
-	ci.Proof, err = Sign(Keccak256(ci.Seed), ck) // TODO VRF support
-	return err
+	copy(ci.Proof, proof)
 }
 
 // ChainID returns the ChainID

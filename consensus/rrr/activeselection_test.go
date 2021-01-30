@@ -17,7 +17,8 @@ import (
 )
 
 var (
-	dummySeed = []byte{0, 1, 2, 3, 4, 5, 6, 7}
+	dummySeed  = []byte{0, 1, 2, 3, 4, 5, 6, 7}
+	dummyProof = []byte{0, 1, 2, 3, 4, 5, 6, 7}
 )
 
 func TestDecodeGenesisActivity(t *testing.T) {
@@ -27,7 +28,7 @@ func TestDecodeGenesisActivity(t *testing.T) {
 	var err error
 	keys := requireGenerateKeys(t, 3)
 	ge := requireMakeGenesisExtra(t,
-		keys[0], []byte{0, 1, 2, 3, 4, 5, 6, 7}, identitiesFromKeys(keys...)...)
+		keys[0], dummySeed, dummyProof, identitiesFromKeys(keys...)...)
 	assert.Nil(err, "error")
 
 	genesis := makeBlock(withExtra(requireEncodeToBytes(t, ge)))
@@ -43,7 +44,7 @@ func TestDecodeActivity(t *testing.T) {
 
 	keys := requireGenerateKeys(t, 3)
 	ge := requireMakeGenesisExtra(t,
-		keys[0], []byte{0, 1, 2, 3, 4, 5, 6, 7}, identitiesFromKeys(keys...)...)
+		keys[0], dummySeed, dummyProof, identitiesFromKeys(keys...)...)
 
 	genesis := makeBlock(withExtra(requireEncodeToBytes(t, ge)))
 
@@ -237,8 +238,8 @@ func TestBranchDetection(t *testing.T) {
 // As is the case when one or more identities are idle - idle means "not seen
 // within Ta active". Also, except for the early stages of the chain, Ta
 // (active) will be smaller than the block height and this covers that scenario
-// too. Note that AccumulateActive does not explicitly identify idles - it leaves
-// the unvisited items in the list in their last known possition.
+// too. Note that AccumulateActive does not explicitly identify idles - it
+// leaves the unvisited items in the list in their last known possition.
 // selectCandidatesAndEndorsers deals with pruning and moving to the idle pool.
 func TestShortActityHorizon(t *testing.T) {
 	require := require.New(t)
@@ -384,7 +385,7 @@ func newNetwork(t *testing.T, numIdents int) *network {
 	}
 
 	net.ge = requireMakeGenesisExtra(t,
-		net.keys[0], []byte{0, 1, 2, 3, 4, 5, 6, 7},
+		net.keys[0], dummySeed, dummyProof,
 		identities...)
 
 	net.genesis = makeBlock(withExtra(requireEncodeToBytes(t, net.ge)))
@@ -496,13 +497,13 @@ func fillIntent(
 func requireMakeGenesisExtra(
 	t *testing.T,
 	key *ecdsa.PrivateKey,
-	seed []byte, identities ...Hash) *GenesisExtraData {
+	seed, proof []byte, identities ...Hash) *GenesisExtraData {
 
 	initIdents, err := IdentInit(key, nil, identities...)
 	require.NoError(t, err)
 
 	extra := &GenesisExtraData{}
-	err = extra.ChainInit.Populate(key, initIdents, seed)
+	err = extra.ChainInit.Populate(key, initIdents, seed, proof)
 	require.NoError(t, err)
 	return extra
 }

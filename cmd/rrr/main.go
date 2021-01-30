@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	ecvrf "github.com/vechain/go-ecvrf"
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -116,17 +116,12 @@ func genextra(ctx *cli.Context) error {
 
 	extra := &rrr.GenesisExtraData{}
 
-	// XXX: TODO cli option to provide explicit seed
-	seed := make([]byte, 8)
-	var nrand int
-	nrand, err = rand.Read(seed)
-	if err != nil || nrand != 8 {
-		return fmt.Errorf("failed reading random seed")
-	}
+	vrf := ecvrf.NewSecp256k1Sha256Tai()
+	// The alpha for the geneis block is the node id of the signer of the
+	// ChainInit, the beta is the seed for the first round
+	seed, pi, err := vrf.Prove(key, signerNodeID[:])
 
-	if err = extra.ChainInit.Populate(key, initIdents, seed); err != nil {
-		return err
-	}
+	extra.ChainInit.Populate(key, initIdents, seed, pi)
 
 	var b []byte
 	if b, err = rlp.EncodeToBytes(extra); err != nil {
