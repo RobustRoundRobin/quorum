@@ -362,6 +362,7 @@ func (r *RoundState) nextRoundState(
 	r.candidates, r.endorsers, r.selection, err = r.a.SelectCandidatesAndEndorsers(
 		r.Rand.Perm,
 		uint(r.config.Candidates), uint(r.config.Endorsers), uint(r.config.Quorum),
+		uint(r.config.Activity),
 		r.FailedAttempts,
 		chain, r.nodeID)
 	if err != nil {

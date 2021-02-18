@@ -19,15 +19,17 @@ experimentation and testing.
 
 ## Remaining items from the paper, required for production readines:
 
-* [ ] VRF's and proofs for seeding the random selection of endorsers
-* [ ] Allow the chain to progress if all Nc candidates in a round fail to
+* [x] VRF's and proofs for seeding the random selection of endorsers
+* [ ] VRF seed initialisation
+* [x] Allow the chain to progress if all Nc candidates in a round fail to
       seal a block. Currently one of the Nc candidates must seal a block in
       order for the chain to progress - as we have for convenience made round ==
       block. A round is triggered by a new chain head. And the Nc identities
       are only updated at the start of a round.
 * [ ] Exclude unresponsive nodes from selection - make idle
 * [ ] Re-enrolment of idle identities
-* [ ] Membership change post genesis - both addition and removal
+* [x] Enrolement post genesis
+* [ ] Respect --permissioned and --permissioned-nodes (this offers a form of identity removal)
 * [ ] Wait Te rounds before considering a freshly enrolled identity 'active'.
       As a grinding attach mitigation for re-enrolment
 * [ ] Full implementation of VerifyBranch

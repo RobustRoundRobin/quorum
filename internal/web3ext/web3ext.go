@@ -34,6 +34,7 @@ var Modules = map[string]string{
 	"txpool":           TxpoolJs,
 	"les":              LESJs,
 	"raft":             Raft_JS,
+	"rrr":              RRR_JS,
 	"istanbul":         Istanbul_JS,
 	"quorumPermission": QUORUM_NODE_JS,
 	"quorumExtension":  Extension_JS,
@@ -1043,6 +1044,54 @@ web3._extend({
 		new web3._extend.Property({
 			name: 'nodeAddress',
 			getter: 'istanbul_nodeAddress'
+		}),
+	]
+});
+`
+
+const RRR_JS = `
+web3._extend({
+	property: 'rrr',
+	methods:
+	[
+		new web3._extend.Method({
+			name: 'seeding',
+			call: 'rrr_seeding',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'chainID',
+			call: 'rrr_chainID',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'queueEnrolment',
+			call: 'rrr_queueEnrolment',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'isEnrolmentPending',
+			call: 'rrr_isEnrolmentPending',
+			params: 1
+		}),
+	],
+	properties:
+	[
+		new web3._extend.Property({
+			name: 'chainID',
+			getter: 'rrr_chainID'
+		}),
+		new web3._extend.Property({
+			name: 'nodeID',
+			getter: 'rrr_nodeID'
+		}),
+		new web3._extend.Property({
+			name: 'nodeAddress',
+			getter: 'rrr_nodeAddress'
+		}),
+		new web3._extend.Property({
+			name: 'nodePublic',
+			getter: 'rrr_nodePublic'
 		}),
 	]
 });

@@ -256,6 +256,11 @@ func (a *ActiveSelection) AccumulateActive(
 
 		h := Hash(cur.Hash())
 
+		// The seal hash must be used to verify enrolments as the enrolements are
+		// contained in the extra data and obviously cant reference the full
+		// hash of the block header they are delivered in.
+		hseal := Hash(sealHash(cur))
+
 		// Reached the last block we updated for, we are done
 		if h == a.lastBlockSeen {
 			a.logger.Trace("RRR accumulateActive - complete, reached last seen", "#", h.Hex())
@@ -324,7 +329,7 @@ func (a *ActiveSelection) AccumulateActive(
 		a.enrolIdentities(
 			chainID, youngestKnown,
 			blockActivity.SealerID, blockActivity.SealerPub, blockActivity.Enrol,
-			h, cur.Number)
+			h, hseal, cur.Number)
 
 		// The endorsers are active, they do not move in the age ordering.
 		// Note however, for any identity enrolled after genesis, as we are
@@ -366,7 +371,7 @@ type randPerm func(int) []int
 // assuming they run accumulateActive starting from the same `head' block. This
 // is both SelectCandidates and SelectEndorsers from the paper.
 func (a *ActiveSelection) SelectCandidatesAndEndorsers(
-	randPerm randPerm, nCandidates, nEndorsers, quorum, failedAttempts uint,
+	randPerm randPerm, nCandidates, nEndorsers, quorum, activityHorizon, failedAttempts uint,
 	chain RRRChainReader, selfNodeID Hash,
 ) (map[common.Address]bool, map[common.Address]bool, []common.Address, error) {
 
@@ -396,7 +401,7 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 	nActive := uint(a.activeSelection.Len())
 	if nActive < uint(nCandidates+quorum) {
 		return nil, nil, nil, fmt.Errorf(
-			"%v < %v(c) + %v(q):%w", nActive, nCandidates, quorum, errInsuficientActiveIdents)
+			"%v < %v(c) + %v(q), len(idle)=%v:%w", nActive, nCandidates, quorum, len(a.idlePool), errInsuficientActiveIdents)
 	}
 
 	iFirstLeader, iLastLeader := a.calcLeaderWindow(nCandidates, nEndorsers, nActive, failedAttempts)
@@ -432,7 +437,7 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 	// all endorser positions which are >= iFirstLeader
 
 	endorserPosition := 0
-	for cur, icur := a.activeSelection.Back(), uint(0); cur != nil; cur, icur = next, icur+1 {
+	for cur, icur, inext := a.activeSelection.Back(), uint(0), uint(0); cur != nil; cur, icur = next, inext {
 
 		next = cur.Prev() // so we can remove, and yes, we are going 'backwards'
 
@@ -440,11 +445,14 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 
 		lastActive := age.lastActiveBlock()
 
-		if !a.withinActivityHorizon(nActive, lastActive) {
+		if !a.withinActivityHorizon(activityHorizon, lastActive) {
 			a.logger.Trace("RRR selectCandEs - moving to idle set",
 				"gi", age.genesisOrder, "end", age.endorsedBlock, "last", a.activeBlockFence)
+
+			// don't consume the position
 			continue
 		}
+		inext++
 
 		addr := age.nodeID.Address()
 
@@ -514,46 +522,52 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 		endorserPosition++ // endorserPosition advances for all active endorsers
 	}
 
-	if true {
-		// XXX: Use the lazy logger here
-		// dump a report of the selection. Can later make this configurable. By
-		// reporting as "block.order", we can, for small development networks,
-		// easily correlate with the network. We probably also want the full
-		// list of nodeID's for larger scale testing.
-		strcans := []string{}
-		strends := []string{}
-
-		for _, addr := range selection {
-
-			if Address(addr) == zeroAddr {
-				a.logger.Info("RRR RRR selectCandEs - no endorsers, to few candidates",
-					"len", len(selection), "nc", nCandidates, "ne", nEndorsers)
-				break // fewer than desired candidates
-			}
-			// it is a programming error if we get nil here, either for the map entry or for the type assertion
-			el := a.aged[Address(addr)]
-			if el == nil {
-				a.logger.Crit("no entry for", "addr", addr.Hex())
-			}
-			age := el.Value.(*idActivity)
-			if age == nil {
-				a.logger.Crit("element with no value", "addr", addr.Hex())
-			}
-
-			s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, Address(addr).HexShort())
-			if candidates[common.Address(addr)] {
-				strcans = append(strcans, s)
-			} else {
-				strends = append(strends, s)
-			}
-		}
-		a.logger.Debug("RRR selectCandEs selected", "cans", strings.Join(strcans, ","))
-		a.logger.Debug("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
-	}
+	a.logSelection(candidates, endorsers, selection, nCandidates, nEndorsers)
 
 	a.logger.Debug("RRR selectCandEs - iendorsers", "p", permutation)
 
 	return candidates, endorsers, selection, nil
+}
+
+func (a *ActiveSelection) logSelection(
+
+	candidates map[common.Address]bool, endorsers map[common.Address]bool,
+	selection []common.Address, nCandidates, nEndorsers uint) {
+
+	// XXX: Use the lazy logger here
+	// dump a report of the selection. Can later make this configurable. By
+	// reporting as "block.order", we can, for small development networks,
+	// easily correlate with the network. We probably also want the full
+	// list of nodeID's for larger scale testing.
+	strcans := []string{}
+	strends := []string{}
+
+	for _, addr := range selection {
+
+		if Address(addr) == zeroAddr {
+			a.logger.Info("RRR RRR selectCandEs - no endorsers, to few candidates",
+				"len", len(selection), "nc", nCandidates, "ne", nEndorsers)
+			break // fewer than desired candidates
+		}
+		// it is a programming error if we get nil here, either for the map entry or for the type assertion
+		el := a.aged[Address(addr)]
+		if el == nil {
+			a.logger.Crit("no entry for", "addr", addr.Hex())
+		}
+		age := el.Value.(*idActivity)
+		if age == nil {
+			a.logger.Crit("element with no value", "addr", addr.Hex())
+		}
+
+		s := fmt.Sprintf("%d.%d:%s", age.ageBlock, age.order, Address(addr).HexShort())
+		if candidates[common.Address(addr)] {
+			strcans = append(strcans, s)
+		} else {
+			strends = append(strends, s)
+		}
+	}
+	a.logger.Debug("RRR selectCandEs selected", "cans", strings.Join(strcans, ","))
+	a.logger.Debug("RRR selectCandEs selected", "ends", strings.Join(strends, ","))
 }
 
 // LeaderForRoundAttempt determines if the provided identity was selected as
@@ -595,7 +609,7 @@ func (a *idActivity) lastActiveBlock() *big.Int {
 
 func (a *ActiveSelection) enrolIdentities(
 	chainID Hash, fence *list.Element, sealerID Hash,
-	sealerPub []byte, enrolments []Enrolment, block Hash, number *big.Int,
+	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, number *big.Int,
 ) error {
 
 	enbind := &EnrolmentBinding{
@@ -606,7 +620,7 @@ func (a *ActiveSelection) enrolIdentities(
 	if number.Cmp(big0) > 0 {
 		enbind.ChainID = chainID
 		enbind.Round.Set(number)
-		enbind.BlockHash = block
+		enbind.BlockHash = blockSeal
 	}
 
 	verifyEnrolment := func(e Enrolment, reEnrol bool) (bool, error) {
@@ -621,11 +635,14 @@ func (a *ActiveSelection) enrolIdentities(
 		if u != e.U {
 			// We try with and without re-enrolment set, so hash match isn't an
 			// error
+			a.logger.Debug("RRR enrolIdentities - u != e.U", "u", u.Hex(), "e.U", e.U.Hex())
 			return false, nil
 		}
 
 		// Did the block sealer sign the indidual enrolment.
 		if !VerifySignature(sealerPub, u[:], e.Q[:64]) {
+			a.logger.Info("RRR enrolIdentities - verify failed",
+				"sealerID", sealerID.Hex(), "e.ID", e.ID.Hex(), "e.U", e.U.Hex())
 			return false, fmt.Errorf("sealer-id=`%s',id=`%s',u=`%s':%w",
 				sealerID.Hex(), e.ID.Hex(), u.Hex(), errEnrolmentNotSignedBySealer)
 		}
@@ -672,6 +689,7 @@ func (a *ActiveSelection) enrolIdentities(
 				"bn", number, "#", block.Hex())
 			continue
 		}
+		a.logger.Info("RRR enroled identity", "id", enr.ID.Hex(), "bn", number, "#", block.Hex())
 
 		a.refreshAge(fence, enr.ID, block, number, order)
 	}

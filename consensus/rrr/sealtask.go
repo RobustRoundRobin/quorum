@@ -290,6 +290,8 @@ func (r *RoundState) sealCurrentBlock(chain RRRChainReader) (bool, error) {
 
 	r.intentMu.Lock()
 	defer r.intentMu.Unlock()
+	r.pendingEnrolmentsMu.Lock()
+	defer r.pendingEnrolmentsMu.Unlock()
 
 	if r.intent == nil {
 		r.logger.Debug("RRR no outstanding intent")
@@ -365,6 +367,7 @@ func (r *RoundState) sealCurrentBlock(chain RRRChainReader) (bool, error) {
 			SealTime: uint64(time.Now().Unix()),
 			Intent:   r.intent.SI.Intent,
 			Confirm:  make([]Endorsement, len(r.intent.Endorsements)),
+			Enrol:    make([]Enrolment, len(r.pendingEnrolments)),
 			Seed:     beta,
 			Proof:    pi,
 		},
@@ -373,6 +376,25 @@ func (r *RoundState) sealCurrentBlock(chain RRRChainReader) (bool, error) {
 	for i, c := range r.intent.Endorsements {
 		data.Confirm[i] = c.Endorsement
 	}
+
+	i := int(0)
+	for _, eb := range r.pendingEnrolments {
+
+		// The round and block hash are not known when the enrolment is queued.
+		eb.Round.Set(r.Number)
+		eb.BlockHash = r.intent.SealHash
+
+		u, err := eb.U()
+		if err != nil {
+			return false, err
+		}
+		data.Enrol[i].Q.Fill(r.privateKey, u) // faux attestation
+		data.Enrol[i].U = u
+		data.Enrol[i].ID = eb.NodeID
+		r.logger.Debug("RRR sealCurrentBlock - adding enrolment", "id", eb.NodeID.Hex(), "seal#", eb.BlockHash.Hex(), "u", u.Hex())
+		i++
+	}
+	r.pendingEnrolments = make(map[common.Hash]*EnrolmentBinding)
 
 	seal, err := data.SignedEncode(r.privateKey)
 	if err != nil {
@@ -388,6 +410,7 @@ func (r *RoundState) sealCurrentBlock(chain RRRChainReader) (bool, error) {
 		"now", time.Now(), "bt", header.Time,
 		"bn", block.Number(), "r", r.intent.SI.Intent.RoundNumber,
 		"ends", len(data.Confirm),
+		"enrl", len(data.Enrol),
 		"#", block.Hash(), "addr", r.nodeAddr.Hex())
 
 	r.sealTask = nil

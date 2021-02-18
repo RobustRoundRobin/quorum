@@ -20,7 +20,6 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/rpc"
 	lru "github.com/hashicorp/golang-lru"
 	"golang.org/x/crypto/sha3"
 )
@@ -95,11 +94,6 @@ type RMsg struct {
 	Raw rlp.RawValue
 }
 
-// API is a user facing RPC API to dump Istanbul state
-type API struct {
-	chain consensus.ChainReader
-	rrr   *engine
-}
 type chainSubscriber interface {
 	SubscribeChainEvent(ch chan<- core.ChainEvent) event.Subscription
 	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
@@ -128,6 +122,11 @@ type engSignedEndorsement struct {
 	Pub        []byte // Derived from signature
 	ReceivedAt time.Time
 	Seq        uint // from RMsg
+}
+
+type engEnrolIdentity struct {
+	NodeID  common.Hash
+	ReEnrol bool
 }
 
 // engine implements consensus.Engine using Robust Round Robin consensus
@@ -293,6 +292,10 @@ func (e *engine) run(chain RRRChainReader, ch <-chan interface{}) {
 			case *engSealTask:
 
 				e.r.NewSealTask(e, et)
+
+			case *engEnrolIdentity:
+
+				e.r.QueueEnrolment(et)
 
 			case *engSignedIntent:
 
@@ -728,7 +731,7 @@ func sealHash(header *types.Header) common.Hash {
 
 	h := common.Hash{}
 
-	rlp.Encode(hasher, []interface{}{
+	err := rlp.Encode(hasher, []interface{}{
 		header.ParentHash,
 		header.UncleHash,
 		header.Coinbase,
@@ -743,6 +746,9 @@ func sealHash(header *types.Header) common.Hash {
 		header.Time,
 		header.Extra[:RRRExtraVanity],
 	})
+	if err != nil {
+		panic("can't encode for sealHash: " + err.Error())
+	}
 	hasher.Sum(h[:0])
 	return h
 }
@@ -752,17 +758,6 @@ func sealHash(header *types.Header) common.Hash {
 func (e *engine) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
 	e.logger.Debug("RRR CalcDifficulty")
 	return e.r.CalcDifficulty(e.r.nodeAddr)
-}
-
-// APIs returns the RPC APIs this consensus engine provides.
-func (e *engine) APIs(chain consensus.ChainReader) []rpc.API {
-	return []rpc.API{}
-	// return []rpc.API{{
-	// 	Namespace: "rrr",
-	// 	Version:   "1.0",
-	// 	Service:   &API{chain: chain, rrr: e},
-	// 	Public:    true,
-	// }}
 }
 
 // Protocol returns the protocol for this consensus

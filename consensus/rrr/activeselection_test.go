@@ -503,8 +503,7 @@ func requireMakeGenesisExtra(
 	require.NoError(t, err)
 
 	extra := &GenesisExtraData{}
-	err = extra.ChainInit.Populate(key, initIdents, seed, proof)
-	require.NoError(t, err)
+	extra.ChainInit.Populate(key, initIdents, seed, proof)
 	return extra
 }
 

@@ -76,7 +76,6 @@ type RoundState struct {
 
 	config     *Config
 	genesisEx  GenesisExtraData
-	ChainID    Hash
 	privateKey *ecdsa.PrivateKey
 	nodeID     Hash // derived from privateKey
 	nodeAddr   common.Address
@@ -105,6 +104,9 @@ type RoundState struct {
 	// the intent phase, until the end of the phase or until we see an intent
 	// from the oldest candidate.
 	signedIntent *engSignedIntent
+
+	pendingEnrolmentsMu sync.RWMutex
+	pendingEnrolments   map[common.Hash]*EnrolmentBinding
 
 	a *ActiveSelection
 }
@@ -153,6 +155,8 @@ func NewRoundState(key *ecdsa.PrivateKey, config *Config, logger log.Logger) *Ro
 		config:   config,
 		vrf:      ecvrf.NewSecp256k1Sha256Tai(),
 		T:        NewRoundTime(config.RoundLength, config.ConfirmPhase, logger),
+
+		pendingEnrolments: make(map[common.Hash]*EnrolmentBinding),
 	}
 	return s
 }
@@ -237,6 +241,40 @@ func (r *RoundState) PrimeActiveSelection(chain RRRChainReader) error {
 	return nil
 }
 
+// QueueEnrolment enrols a node id. This enrolment is completely open. The SGX
+// identity attestation and the minining identity approaches are not presently
+// included.
+func (r *RoundState) QueueEnrolment(et *engEnrolIdentity) error {
+	r.pendingEnrolmentsMu.Lock()
+	defer r.pendingEnrolmentsMu.Unlock()
+
+	eb := &EnrolmentBinding{
+		ChainID: r.genesisEx.ChainID,
+		NodeID:  Hash(et.NodeID),
+		// Round will be updated when we are ready to submit the enrolment. We
+		// record it here so we can keep track of how long enrolments have been
+		// queued.
+		Round: big.NewInt(0).Set(r.Number),
+		// Block hash filled in when we issue the intent containing this
+		// enrolment.
+
+		// XXX: ReEnrol flag is not necessary for non SGX implementations afaict.
+		ReEnrol: et.ReEnrol,
+	}
+
+	r.pendingEnrolments[et.NodeID] = eb
+	return nil
+}
+
+// IsEnrolmentPending returns true if there is an enrolment request queued for
+// the nodeID
+func (r *RoundState) IsEnrolmentPending(nodeID common.Hash) bool {
+	r.pendingEnrolmentsMu.RLock()
+	defer r.pendingEnrolmentsMu.RUnlock()
+	_, ok := r.pendingEnrolments[nodeID]
+	return ok
+}
+
 // NewSignedIntent keeps track of the oldest intent seen in a round. At the end
 // of the intent phase (in PhaseTick), if the node is an endorser, an endorsment
 // is sent to the oldest seen. Only the most recent intent from any identity
@@ -265,8 +303,7 @@ func (r *RoundState) NewSignedIntent(et *engSignedIntent) {
 
 // handleIntent accepts the intent and queues it for endorsement if the
 // intendee is a candidate for the current round given the failedAttempts
-// provided on the intent. As a special case, if we see the intent from the
-// oldest selected identity, we broadcast it immediately.
+// provided on the intent.
 //  Our critical role here is to always select the *OLDEST* intent we see, and
 // to allow a 'fair' amount of time for intents to arrive before choosing one
 // to endorse. In a healthy network, there will be no failedAttempts, and we

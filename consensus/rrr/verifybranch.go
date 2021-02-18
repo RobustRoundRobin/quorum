@@ -137,6 +137,9 @@ func (r *RoundState) verifyHeader(chain consensus.ChainReader, header *types.Hea
 	alpha := r.genesisEx.ChainInit.Seed
 	if r.config.StablePrefixDepth < blockNumber {
 		stableHeader := chain.GetHeaderByNumber(blockNumber - r.config.StablePrefixDepth)
+		if stableHeader == nil {
+			return nil, fmt.Errorf("block at stablePrefixDepth not found: %d - %d", blockNumber, r.config.StablePrefixDepth)
+		}
 		se, _, _, err := decodeHeaderSeal(stableHeader)
 		if err != nil {
 			return nil, fmt.Errorf("failed decoding stable header seal: %v", err)
